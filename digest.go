@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -11,24 +10,41 @@ import (
 )
 
 func runDigest(args []string) {
-	fs := flag.NewFlagSet("digest", flag.ExitOnError)
-	jsonOut := fs.Bool("json", false, "Output as JSON")
-	projectDir := fs.String("project-dir", "", "Project directory for digest output")
-	fs.Parse(args)
+	// Manually extract flags and positional args since Go's flag package
+	// stops at the first non-flag argument
+	var jsonOut bool
+	var projectDir string
+	var positional []string
 
-	if fs.NArg() < 1 {
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--json", "-json":
+			jsonOut = true
+		case "--project-dir", "-project-dir":
+			if i+1 < len(args) {
+				projectDir = args[i+1]
+				i++
+			}
+		default:
+			if !strings.HasPrefix(args[i], "-") {
+				positional = append(positional, args[i])
+			}
+		}
+	}
+
+	if len(positional) < 1 {
 		fmt.Fprintln(os.Stderr, "usage: sesh digest <session.jsonl> [--json] [--project-dir DIR]")
 		os.Exit(1)
 	}
 
-	path := fs.Arg(0)
+	path := positional[0]
 	session, err := ParseSession(path)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "sesh digest: %v\n", err)
 		os.Exit(1)
 	}
 
-	if *jsonOut {
+	if jsonOut {
 		data := DigestJSON(session)
 		os.Stdout.Write(data)
 		fmt.Println()
@@ -37,12 +53,9 @@ func runDigest(args []string) {
 
 	md := DigestMarkdown(session)
 
-	if *projectDir != "" || session.CWD != "" {
-		dir := *projectDir
-		if dir == "" {
-			dir = session.CWD
-		}
-		if err := WriteDigest(session, md, dir); err != nil {
+	if projectDir != "" {
+		// Write to file, don't print to stdout
+		if err := WriteDigest(session, md, projectDir); err != nil {
 			fmt.Fprintf(os.Stderr, "sesh digest: write failed: %v\n", err)
 			os.Exit(1)
 		}
@@ -136,16 +149,34 @@ func filterModifiedFiles(s Session) []string {
 
 // DigestJSON returns the session as JSON bytes.
 func DigestJSON(s Session) []byte {
+	// Ensure nil slices become empty arrays in JSON
+	prompts := s.Prompts
+	if prompts == nil {
+		prompts = []string{}
+	}
+	files := s.Files
+	if files == nil {
+		files = []string{}
+	}
+	commits := s.Commits
+	if commits == nil {
+		commits = []string{}
+	}
+	errors := s.Errors
+	if errors == nil {
+		errors = []string{}
+	}
+
 	out := map[string]interface{}{
 		"sessionId": s.ID,
 		"project":   s.Project,
 		"branch":    s.Branch,
 		"cwd":       s.CWD,
-		"prompts":   s.Prompts,
+		"prompts":   prompts,
 		"tools":     s.Tools,
-		"files":     s.Files,
-		"commits":   s.Commits,
-		"errors":    s.Errors,
+		"files":     files,
+		"commits":   commits,
+		"errors":    errors,
 	}
 	if !s.StartTime.IsZero() {
 		out["startTime"] = s.StartTime.Format(time.RFC3339)
