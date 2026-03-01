@@ -10,7 +10,11 @@ import (
 	"strings"
 )
 
-func runInstall(args []string) {
+func runInstall(args []string) int {
+	initTelemetry()
+	ev := Event{Cmd: "install", OK: true}
+	defer func() { emit(ev) }()
+
 	fs := flag.NewFlagSet("install", flag.ExitOnError)
 	dryRun := fs.Bool("dry-run", false, "Show what would be done")
 	fs.Parse(args)
@@ -18,14 +22,26 @@ func runInstall(args []string) {
 	results := Install(*dryRun)
 
 	for _, r := range results {
+		switch {
+		case r.Error != "":
+			ev.StepsFail++
+		case r.Skipped:
+			ev.StepsSkip++
+		default:
+			ev.StepsOK++
+		}
+
 		if r.Skipped {
 			fmt.Printf("  skip: %s (already configured)\n", r.Action)
 		} else if *dryRun {
 			fmt.Printf("  would: %s\n", r.Action)
+		} else if r.Error != "" {
+			fmt.Printf("  fail: %s (%s)\n", r.Action, r.Error)
 		} else {
 			fmt.Printf("  done: %s\n", r.Action)
 		}
 	}
+	return 0
 }
 
 // InstallResult describes what an install step did.
@@ -55,7 +71,10 @@ func Install(dryRun bool) []InstallResult {
 }
 
 func installSymlink(dryRun bool) InstallResult {
-	homeDir, _ := os.UserHomeDir()
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return InstallResult{Action: "symlink ~/bin/sesh", Error: "home dir: " + err.Error()}
+	}
 	target := filepath.Join(homeDir, "bin", "sesh")
 
 	// Check if already exists and points to us
@@ -86,7 +105,10 @@ func installSymlink(dryRun bool) InstallResult {
 
 func installHooks(dryRun bool) []InstallResult {
 	var results []InstallResult
-	homeDir, _ := os.UserHomeDir()
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return []InstallResult{{Action: "register hooks in settings.json", Error: "home dir: " + err.Error()}}
+	}
 	settingsPath := filepath.Join(homeDir, ".claude", "settings.json")
 
 	data, err := os.ReadFile(settingsPath)
@@ -190,7 +212,10 @@ func addHookIfMissing(hooks map[string]json.RawMessage, event string, command st
 }
 
 func installGitignore(dryRun bool) InstallResult {
-	homeDir, _ := os.UserHomeDir()
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return InstallResult{Action: "add .claude/digests/ to ~/.gitignore_global", Error: "home dir: " + err.Error()}
+	}
 	path := filepath.Join(homeDir, ".gitignore_global")
 	entry := ".claude/digests/"
 
@@ -222,7 +247,13 @@ func installGitignore(dryRun bool) InstallResult {
 
 func installCron(dryRun bool) InstallResult {
 	action := "add nightly cron-curate entry"
-	cronLine := "0 2 * * *  ~/bin/sesh cron-curate >> ~/Sync/housekeeping-logs/sesh-curate.log 2>&1"
+
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return InstallResult{Action: action, Error: "home dir: " + err.Error()}
+	}
+
+	cronLine := "0 2 * * *  ~/bin/sesh cron-curate >> ~/.claude/logs/sesh-curate.log 2>&1"
 
 	// Check existing crontab
 	out, err := exec.Command("crontab", "-l").Output()
@@ -233,6 +264,9 @@ func installCron(dryRun bool) InstallResult {
 	if dryRun {
 		return InstallResult{Action: action}
 	}
+
+	// Ensure log directory exists
+	os.MkdirAll(filepath.Join(homeDir, ".claude", "logs"), 0755)
 
 	// Add to crontab
 	existing := string(out)

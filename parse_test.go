@@ -7,7 +7,7 @@ import (
 )
 
 func TestParseSessionEvents(t *testing.T) {
-	s, err := ParseSession("testdata/sample.jsonl")
+	s, _, err := ParseSession("testdata/sample.jsonl")
 	if err != nil {
 		t.Fatalf("ParseSession: %v", err)
 	}
@@ -21,7 +21,7 @@ func TestParseSessionEvents(t *testing.T) {
 }
 
 func TestExtractMetadata(t *testing.T) {
-	s, err := ParseSession("testdata/sample.jsonl")
+	s, _, err := ParseSession("testdata/sample.jsonl")
 	if err != nil {
 		t.Fatalf("ParseSession: %v", err)
 	}
@@ -38,7 +38,7 @@ func TestExtractMetadata(t *testing.T) {
 }
 
 func TestExtractUserPrompts(t *testing.T) {
-	s, err := ParseSession("testdata/sample.jsonl")
+	s, _, err := ParseSession("testdata/sample.jsonl")
 	if err != nil {
 		t.Fatalf("ParseSession: %v", err)
 	}
@@ -52,7 +52,7 @@ func TestExtractUserPrompts(t *testing.T) {
 }
 
 func TestExtractToolCalls(t *testing.T) {
-	s, err := ParseSession("testdata/sample.jsonl")
+	s, _, err := ParseSession("testdata/sample.jsonl")
 	if err != nil {
 		t.Fatalf("ParseSession: %v", err)
 	}
@@ -73,7 +73,7 @@ func TestExtractToolCalls(t *testing.T) {
 }
 
 func TestFilesOnlyEditWrite(t *testing.T) {
-	s, err := ParseSession("testdata/sample.jsonl")
+	s, _, err := ParseSession("testdata/sample.jsonl")
 	if err != nil {
 		t.Fatalf("ParseSession: %v", err)
 	}
@@ -86,7 +86,7 @@ func TestFilesOnlyEditWrite(t *testing.T) {
 }
 
 func TestExtractFiles(t *testing.T) {
-	s, err := ParseSession("testdata/sample.jsonl")
+	s, _, err := ParseSession("testdata/sample.jsonl")
 	if err != nil {
 		t.Fatalf("ParseSession: %v", err)
 	}
@@ -108,7 +108,7 @@ func TestExtractFiles(t *testing.T) {
 }
 
 func TestExtractCommits(t *testing.T) {
-	s, err := ParseSession("testdata/sample.jsonl")
+	s, _, err := ParseSession("testdata/sample.jsonl")
 	if err != nil {
 		t.Fatalf("ParseSession: %v", err)
 	}
@@ -122,7 +122,7 @@ func TestExtractCommits(t *testing.T) {
 }
 
 func TestExtractErrors(t *testing.T) {
-	s, err := ParseSession("testdata/errors.jsonl")
+	s, _, err := ParseSession("testdata/errors.jsonl")
 	if err != nil {
 		t.Fatalf("ParseSession: %v", err)
 	}
@@ -154,7 +154,7 @@ func TestExtractErrors(t *testing.T) {
 }
 
 func TestParseEmptySession(t *testing.T) {
-	s, err := ParseSession("testdata/empty.jsonl")
+	s, _, err := ParseSession("testdata/empty.jsonl")
 	if err != nil {
 		t.Fatalf("ParseSession: %v", err)
 	}
@@ -171,7 +171,7 @@ func TestParseEmptySession(t *testing.T) {
 }
 
 func TestFilterSidechains(t *testing.T) {
-	s, err := ParseSession("testdata/sample.jsonl")
+	s, _, err := ParseSession("testdata/sample.jsonl")
 	if err != nil {
 		t.Fatalf("ParseSession: %v", err)
 	}
@@ -203,12 +203,44 @@ func TestLargeSession(t *testing.T) {
 	}
 
 	r := strings.NewReader(builder.String())
-	s, err := ParseSessionReader(r)
+	s, _, err := ParseSessionReader(r)
 	if err != nil {
 		t.Fatalf("ParseSessionReader: %v", err)
 	}
 
 	if s.ID == "" {
 		t.Error("expected non-empty session ID from large input")
+	}
+}
+
+func TestParseStats(t *testing.T) {
+	_, stats, err := ParseSession("testdata/sample.jsonl")
+	if err != nil {
+		t.Fatalf("ParseSession: %v", err)
+	}
+
+	if stats.Lines == 0 {
+		t.Error("expected Lines > 0")
+	}
+	if stats.Sidechains == 0 {
+		t.Error("expected Sidechains > 0 (sample.jsonl has sidechain events)")
+	}
+	// ParseErrors may be 0 for well-formed files
+}
+
+func TestParseStatsCountsErrors(t *testing.T) {
+	// Create a file with some malformed lines
+	content := "{\"bad json\n{\"type\":\"user\",\"sessionId\":\"test\",\"cwd\":\"/tmp\",\"message\":{\"role\":\"user\",\"content\":\"hello\"}}\nalso bad\n"
+	r := strings.NewReader(content)
+	_, stats, err := ParseSessionReader(r)
+	if err != nil {
+		t.Fatalf("ParseSessionReader: %v", err)
+	}
+
+	if stats.Lines != 3 {
+		t.Errorf("Lines = %d, want 3", stats.Lines)
+	}
+	if stats.ParseErrors != 2 {
+		t.Errorf("ParseErrors = %d, want 2", stats.ParseErrors)
 	}
 }

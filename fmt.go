@@ -12,8 +12,13 @@ const (
 	reset = "\033[0m"
 )
 
-func runFmt(args []string) {
+func runFmt(args []string) int {
+	initTelemetry()
+	ev := Event{Cmd: "fmt", OK: true}
+	defer func() { emit(ev) }()
+
 	FormatStream(os.Stdin, os.Stdout)
+	return 0
 }
 
 // FormatStream reads stream-json events from r and writes formatted output to w.

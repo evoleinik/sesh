@@ -929,6 +929,87 @@ else
   warn "$LEAKED temp files leaked"
 fi
 
+# ── 29. TELEMETRY & DOCTOR ─────────────────────────────────────
+echo ""
+echo "=== 29. Telemetry & doctor ==="
+EVENTS_FILE="$HOME/.claude/sesh-events.jsonl"
+EVENTS_BEFORE=0
+if [ -f "$EVENTS_FILE" ]; then
+  EVENTS_BEFORE=$(wc -l < "$EVENTS_FILE")
+fi
+
+# Run digest — should emit a telemetry event
+$SESH digest --json testdata/sample.jsonl >/dev/null 2>&1
+if [ -f "$EVENTS_FILE" ]; then
+  EVENTS_AFTER=$(wc -l < "$EVENTS_FILE")
+  if [ "$EVENTS_AFTER" -gt "$EVENTS_BEFORE" ]; then
+    pass "digest emits telemetry event"
+  else
+    fail "digest did not emit telemetry event"
+  fi
+
+  # Check last event has required fields
+  LAST_EVENT=$(tail -1 "$EVENTS_FILE")
+  HAS_TS=$(echo "$LAST_EVENT" | jq -r '.ts // empty')
+  HAS_CMD=$(echo "$LAST_EVENT" | jq -r '.cmd // empty')
+  HAS_OK=$(echo "$LAST_EVENT" | jq -r '.ok // empty')
+  HAS_DUR=$(echo "$LAST_EVENT" | jq -r '.dur_ms // empty')
+
+  if [ -n "$HAS_TS" ] && [ -n "$HAS_CMD" ] && [ -n "$HAS_OK" ] && [ -n "$HAS_DUR" ]; then
+    pass "telemetry event has required fields (ts, cmd, ok, dur_ms)"
+  else
+    fail "telemetry event missing fields: ts=$HAS_TS cmd=$HAS_CMD ok=$HAS_OK dur_ms=$HAS_DUR"
+  fi
+
+  if [ "$HAS_CMD" = "digest" ]; then
+    pass "telemetry event cmd=digest"
+  else
+    fail "telemetry event cmd=$HAS_CMD, want digest"
+  fi
+else
+  fail "events file not created after digest"
+fi
+
+# Run doctor
+DOCTOR_OUT=$($SESH doctor 2>&1)
+if echo "$DOCTOR_OUT" | grep -q "sesh v"; then
+  pass "sesh doctor shows version"
+else
+  fail "sesh doctor missing version header"
+fi
+
+if echo "$DOCTOR_OUT" | grep -q "telemetry:"; then
+  pass "sesh doctor shows telemetry status"
+else
+  fail "sesh doctor missing telemetry status"
+fi
+
+if echo "$DOCTOR_OUT" | grep -q "hooks:"; then
+  pass "sesh doctor shows hooks status"
+else
+  fail "sesh doctor missing hooks status"
+fi
+
+# Doctor --json
+DOCTOR_JSON=$($SESH doctor --json 2>&1)
+if echo "$DOCTOR_JSON" | jq . >/dev/null 2>&1; then
+  pass "sesh doctor --json is valid JSON"
+else
+  fail "sesh doctor --json is not valid JSON"
+fi
+
+if echo "$DOCTOR_JSON" | jq -e '.version' >/dev/null 2>&1; then
+  pass "doctor JSON has version field"
+else
+  fail "doctor JSON missing version field"
+fi
+
+if echo "$DOCTOR_JSON" | jq -e '.checks' >/dev/null 2>&1; then
+  pass "doctor JSON has checks field"
+else
+  fail "doctor JSON missing checks field"
+fi
+
 # ── SUMMARY ────────────────────────────────────────────────────
 echo ""
 echo "========================================="

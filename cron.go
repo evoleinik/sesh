@@ -11,7 +11,11 @@ import (
 	"time"
 )
 
-func runCronCurate(args []string) {
+func runCronCurate(args []string) int {
+	initTelemetry()
+	ev := Event{Cmd: "cron-curate", OK: true}
+	defer func() { emit(ev) }()
+
 	fs := flag.NewFlagSet("cron-curate", flag.ExitOnError)
 	jsonOut := fs.Bool("json", false, "Output as JSON")
 	fs.Parse(args)
@@ -19,19 +23,28 @@ func runCronCurate(args []string) {
 	results, err := CronCurate()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "sesh cron-curate: %v\n", err)
-		os.Exit(1)
+		ev.OK = false
+		ev.Err = err.Error()
+		return 1
+	}
+
+	ev.Projects = len(results)
+	for _, r := range results {
+		if r.Error == "" && !r.Skipped {
+			ev.Curated++
+		}
 	}
 
 	if *jsonOut {
 		data, _ := json.MarshalIndent(results, "", "  ")
 		os.Stdout.Write(data)
 		fmt.Println()
-		return
+		return 0
 	}
 
 	if len(results) == 0 {
 		fmt.Fprintln(os.Stderr, "sesh cron-curate: no projects with new digests")
-		return
+		return 0
 	}
 
 	for _, r := range results {
@@ -43,6 +56,7 @@ func runCronCurate(args []string) {
 		}
 		fmt.Printf("  %s: %s\n", r.Project, status)
 	}
+	return 0
 }
 
 // CronResult describes what happened for each project.
@@ -83,7 +97,11 @@ func CronCurate() ([]CronResult, error) {
 		}
 
 		hasNew, err := HasNewDigests(decodedPath)
-		if err != nil || !hasNew {
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "sesh: skip %s: %v\n", filepath.Base(decodedPath), err)
+			continue
+		}
+		if !hasNew {
 			continue
 		}
 
@@ -144,7 +162,10 @@ func UpdateCurateMarker(projectDir string) error {
 }
 
 func runCuration(projectDir string) error {
-	homeDir, _ := os.UserHomeDir()
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("home dir: %w", err)
+	}
 	promptPath := filepath.Join(homeDir, "src", "sesh", "prompts", "curate.md")
 
 	if _, err := os.Stat(promptPath); os.IsNotExist(err) {

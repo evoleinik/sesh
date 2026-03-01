@@ -10,7 +10,8 @@ CWD=$(echo "$INPUT" | jq -r '.cwd // empty')
 [ -z "$TRANSCRIPT" ] || [ ! -f "$TRANSCRIPT" ] && exit 0
 
 # Generate digest (should complete in <1s)
-sesh digest "$TRANSCRIPT" --project-dir "$CWD" >> ~/.claude/sesh-debug.log 2>&1
+# Telemetry is self-instrumented by the Go binary (sesh-events.jsonl)
+sesh digest "$TRANSCRIPT" --project-dir "$CWD" 2>/dev/null
 
 # Always exit 0 — never block session shutdown
 exit 0

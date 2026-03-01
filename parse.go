@@ -26,21 +26,29 @@ type Session struct {
 	Errors    []string       // error patterns from tool results
 }
 
+// ParseStats tracks parsing counters for telemetry.
+type ParseStats struct {
+	Lines       int
+	ParseErrors int
+	Sidechains  int
+}
+
 // ParseSession reads a session JSONL file and returns a Session.
-func ParseSession(path string) (Session, error) {
+func ParseSession(path string) (Session, ParseStats, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return Session{}, err
+		return Session{}, ParseStats{}, err
 	}
 	defer f.Close()
 	return ParseSessionReader(f)
 }
 
 // ParseSessionReader reads session events from a reader.
-func ParseSessionReader(r io.Reader) (Session, error) {
+func ParseSessionReader(r io.Reader) (Session, ParseStats, error) {
 	s := Session{
 		Tools: make(map[string]int),
 	}
+	var stats ParseStats
 
 	fileSet := make(map[string]bool)
 	commitSet := make(map[string]bool)
@@ -51,6 +59,7 @@ func ParseSessionReader(r io.Reader) (Session, error) {
 	scanner.Buffer(make([]byte, 0, 1024*1024), 10*1024*1024) // 10MB max line
 
 	for scanner.Scan() {
+		stats.Lines++
 		line := scanner.Bytes()
 		if len(line) == 0 {
 			continue
@@ -58,11 +67,13 @@ func ParseSessionReader(r io.Reader) (Session, error) {
 
 		var raw map[string]json.RawMessage
 		if err := json.Unmarshal(line, &raw); err != nil {
+			stats.ParseErrors++
 			continue // skip malformed lines
 		}
 
 		// Skip sidechains
 		if isSidechain(raw) {
+			stats.Sidechains++
 			continue
 		}
 
@@ -99,7 +110,7 @@ func ParseSessionReader(r io.Reader) (Session, error) {
 	}
 
 	if err := scanner.Err(); err != nil {
-		return s, err
+		return s, stats, err
 	}
 
 	// Derive timing
@@ -122,7 +133,7 @@ func ParseSessionReader(r io.Reader) (Session, error) {
 	}
 	sort.Strings(s.Commits)
 
-	return s, nil
+	return s, stats, nil
 }
 
 func isSidechain(raw map[string]json.RawMessage) bool {

@@ -10,7 +10,11 @@ import (
 	"strings"
 )
 
-func runContext(args []string) {
+func runContext(args []string) int {
+	initTelemetry()
+	ev := Event{Cmd: "context", OK: true}
+	defer func() { emit(ev) }()
+
 	fs := flag.NewFlagSet("context", flag.ExitOnError)
 	jsonOut := fs.Bool("json", false, "Output as JSON")
 	fs.Parse(args)
@@ -20,24 +24,31 @@ func runContext(args []string) {
 		projectDir = fs.Arg(0)
 	}
 
+	ev.Project = filepath.Base(projectDir)
+
 	digests, err := LoadDigests(projectDir)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "sesh context: %v\n", err)
-		os.Exit(1)
+		ev.OK = false
+		ev.Err = err.Error()
+		return 1
 	}
 
+	ev.Digests = len(digests)
+
 	if len(digests) == 0 {
-		return // no output for no digests
+		return 0
 	}
 
 	if *jsonOut {
 		data, _ := json.MarshalIndent(digests, "", "  ")
 		os.Stdout.Write(data)
 		fmt.Println()
-		return
+		return 0
 	}
 
 	fmt.Print(ContextSummary(digests))
+	return 0
 }
 
 // DigestSummary holds parsed header info from a digest file.
@@ -65,6 +76,7 @@ func LoadDigests(projectDir string) ([]DigestSummary, error) {
 		}
 		data, err := os.ReadFile(filepath.Join(dir, e.Name()))
 		if err != nil {
+			fmt.Fprintf(os.Stderr, "sesh: skip digest %s: %v\n", e.Name(), err)
 			continue
 		}
 		content := string(data)

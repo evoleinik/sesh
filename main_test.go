@@ -32,6 +32,7 @@ func TestSubcommandDispatch(t *testing.T) {
 		{[]string{"--help"}, 0},                            // help
 		{[]string{"--version"}, 0},                         // version
 		{[]string{"digest"}, 1},                            // digest without args
+		{[]string{"doctor"}, 0},                            // doctor (no events is ok)
 	}
 
 	for _, tt := range tests {

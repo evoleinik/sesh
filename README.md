@@ -74,6 +74,12 @@ SessionStart hook injects recent session context into Claude's system prompt.
 | `fmt` | Format stream-json stdin | |
 | `install` | One-shot setup | `--dry-run` |
 | `cron-curate` | Curate active projects | `--json` |
+| `doctor` | System health check | `--json` |
+
+## Observability
+
+Every sesh invocation emits a structured event to `~/.claude/sesh-events.jsonl`.
+Run `sesh doctor` for a health summary. Run `sesh doctor --json` for structured output.
 
 ## Files
 
@@ -87,7 +93,9 @@ sesh/
 ├── status.go            # Cross-project dashboard
 ├── install.go           # One-shot setup (hooks, gitignore, cron)
 ├── cron.go              # Nightly curation orchestrator
-├── *_test.go            # 35 tests
+├── telemetry.go         # Event struct, emit() → sesh-events.jsonl
+├── doctor.go            # System health check
+├── *_test.go            # 42 tests
 ├── testdata/            # Test fixtures (real JSONL snippets)
 ├── hooks/
 │   ├── stop-digest.sh   # Claude Code Stop hook

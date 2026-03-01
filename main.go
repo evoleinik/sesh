@@ -19,6 +19,7 @@ Commands:
   fmt                      Format stream-json from stdin
   install                  One-shot setup (hooks, gitignore, cron)
   cron-curate              Curate projects with new digests
+  doctor                   System health check
 
 Flags:
   --json          Output as JSON
@@ -26,9 +27,13 @@ Flags:
   --version       Show version`
 
 func main() {
+	os.Exit(run())
+}
+
+func run() int {
 	if len(os.Args) < 2 {
 		fmt.Fprintln(os.Stderr, usage)
-		os.Exit(1)
+		return 1
 	}
 
 	cmd := os.Args[1]
@@ -36,24 +41,26 @@ func main() {
 	switch cmd {
 	case "--help", "-h", "help":
 		fmt.Println(usage)
-		os.Exit(0)
+		return 0
 	case "--version", "-v":
 		fmt.Println("sesh", version)
-		os.Exit(0)
+		return 0
 	case "digest":
-		runDigest(os.Args[2:])
+		return runDigest(os.Args[2:])
 	case "context":
-		runContext(os.Args[2:])
+		return runContext(os.Args[2:])
 	case "status":
-		runStatus(os.Args[2:])
+		return runStatus(os.Args[2:])
 	case "fmt":
-		runFmt(os.Args[2:])
+		return runFmt(os.Args[2:])
 	case "install":
-		runInstall(os.Args[2:])
+		return runInstall(os.Args[2:])
 	case "cron-curate":
-		runCronCurate(os.Args[2:])
+		return runCronCurate(os.Args[2:])
+	case "doctor":
+		return runDoctor(os.Args[2:])
 	default:
 		fmt.Fprintf(os.Stderr, "sesh: unknown command %q\n\n%s\n", cmd, usage)
-		os.Exit(1)
+		return 1
 	}
 }

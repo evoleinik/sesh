@@ -10,7 +10,11 @@ import (
 	"time"
 )
 
-func runDigest(args []string) {
+func runDigest(args []string) int {
+	initTelemetry()
+	ev := Event{Cmd: "digest", OK: true}
+	defer func() { emit(ev) }()
+
 	// Manually extract flags and positional args since Go's flag package
 	// stops at the first non-flag argument
 	var jsonOut bool
@@ -35,35 +39,49 @@ func runDigest(args []string) {
 
 	if len(positional) < 1 {
 		fmt.Fprintln(os.Stderr, "usage: sesh digest <session.jsonl> [--json] [--project-dir DIR]")
-		os.Exit(1)
+		ev.OK = false
+		ev.Err = "missing argument"
+		return 1
 	}
 
 	path := positional[0]
-	session, err := ParseSession(path)
+	session, stats, err := ParseSession(path)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "sesh digest: %v\n", err)
-		os.Exit(1)
+		ev.OK = false
+		ev.Err = err.Error()
+		return 1
 	}
+
+	ev.Project = session.Project
+	ev.SessionID = session.ID
+	ev.Lines = stats.Lines
+	ev.ParseErrors = stats.ParseErrors
+	ev.Files = len(session.Files)
+	ev.Commits = len(session.Commits)
+	ev.Errors = len(session.Errors)
 
 	if jsonOut {
 		data := DigestJSON(session)
 		os.Stdout.Write(data)
 		fmt.Println()
-		return
+		return 0
 	}
 
 	md := DigestMarkdown(session)
 
 	if projectDir != "" {
-		// Write to file, don't print to stdout
 		if err := WriteDigest(session, md, projectDir); err != nil {
 			fmt.Fprintf(os.Stderr, "sesh digest: write failed: %v\n", err)
-			os.Exit(1)
+			ev.OK = false
+			ev.Err = err.Error()
+			return 1
 		}
-		return
+		return 0
 	}
 
 	fmt.Print(md)
+	return 0
 }
 
 // DigestMarkdown renders a session as a concise markdown summary.

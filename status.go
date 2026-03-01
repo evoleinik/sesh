@@ -9,7 +9,11 @@ import (
 	"strings"
 )
 
-func runStatus(args []string) {
+func runStatus(args []string) int {
+	initTelemetry()
+	ev := Event{Cmd: "status", OK: true}
+	defer func() { emit(ev) }()
+
 	fs := flag.NewFlagSet("status", flag.ExitOnError)
 	jsonOut := fs.Bool("json", false, "Output as JSON")
 	fs.Parse(args)
@@ -17,17 +21,22 @@ func runStatus(args []string) {
 	projects, err := ScanProjects()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "sesh status: %v\n", err)
-		os.Exit(1)
+		ev.OK = false
+		ev.Err = err.Error()
+		return 1
 	}
+
+	ev.Projects = len(projects)
 
 	if *jsonOut {
 		data, _ := json.MarshalIndent(projects, "", "  ")
 		os.Stdout.Write(data)
 		fmt.Println()
-		return
+		return 0
 	}
 
 	RenderStatusTable(projects)
+	return 0
 }
 
 // ProjectStatus holds status info for a project.
