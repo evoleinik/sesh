@@ -2,13 +2,24 @@
 
 Session intelligence for Claude Code. Turns ephemeral session transcripts into persistent, actionable project knowledge — automatically.
 
-## The problem
+## Quick start
 
-Claude Code sessions produce rich structured data (tool calls, file changes, decisions, errors) but this knowledge dies when the session ends. The next session starts from scratch. We compensate manually — updating CLAUDE.md, writing learnings, running curation skills — but this housekeeping tax slows down real work.
+```bash
+# Build
+cd ~/src/sesh && go build -o sesh .
 
-## The insight
+# Install (hooks, gitignore, cron, symlink)
+sesh install --dry-run    # preview
+sesh install              # apply
 
-Sessions are data, not just history. Between raw transcripts (100% fidelity, unusable) and CLAUDE.md (usable, always stale) there's a missing layer: **structured session digests** that are specific enough to be useful and concise enough to not waste tokens.
+# Manual usage
+sesh digest SESSION.jsonl              # parse → markdown digest
+sesh digest --json SESSION.jsonl       # parse → JSON
+sesh context [PROJECT_DIR]             # recent digests summary
+sesh status                            # cross-project dashboard
+sesh fmt                               # format stream-json from stdin
+sesh cron-curate                       # curate projects with new digests
+```
 
 ## Architecture
 
@@ -16,9 +27,9 @@ Three layers, two automated transitions:
 
 ```
 Layer 1: Raw Sessions (JSONL)
-    ↓  stop hook — fast Python, no Claude call, <1s
+    ↓  stop hook — Go binary, <100ms, no Claude call
 Layer 2: Session Digests (structured per-session summaries)
-    ↓  periodic background — ralph + claude
+    ↓  nightly cron — ralph + Claude
 Layer 3: Project Knowledge (curated, merged, pruned)
     ↓  read automatically at session start
 ```
@@ -27,93 +38,80 @@ Layer 3: Project Knowledge (curated, merged, pruned)
 
 Parse the session JSONL and extract a structured summary:
 
-- What files were modified
-- What commits were made (messages)
-- What the user asked for
+- What files were modified (Edit/Write only)
+- What commits were made (subject lines)
+- What the user asked for (first prompt)
 - What tools were used and how much
 - Duration, branch, project
-- Decisions made (heuristic: text before Edit/Write calls)
-- Errors encountered (heuristic: tool_result with error patterns)
+- Errors encountered (deduped)
 
 Output: one `.md` file per session in `PROJECT/.claude/digests/`.
 
-This is pure Python, no Claude call, runs in <1 second. It hooks into Claude Code's stop hook system.
+Single Go binary, no external dependencies, ~60ms on a 5MB session.
 
 ### Layer 2 → 3: Knowledge curation (background)
 
-A periodic job (cron or manual) reads accumulated digests and curates them into refined project knowledge:
+Nightly cron runs `ralph` with the curation prompt on each active project:
 
 - Merge duplicate gotchas across sessions
 - Promote recurring patterns into rules
 - Prune one-time issues that didn't recur
-- Detect documentation gaps (same question asked 3+ times)
-- Propose skills (same tool sequence across 3+ sessions)
+- Detect documentation gaps
 
-This is where Claude adds value — it reads digests and produces curated output. Runs via `ralph` in the background, not in your working session.
-
-Output: updated `.claude-context` or CLAUDE.md additions.
+Run manually: `cd PROJECT && ralph ~/src/sesh/prompts/curate.md 1`
 
 ### Layer 3 → New sessions: Auto-context
 
-New sessions automatically read the curated knowledge. Either:
-- A file that Claude Code's system includes (like CLAUDE.md)
-- A start hook that injects recent context
+SessionStart hook injects recent session context into Claude's system prompt.
 
-Zero-cost to the user. No searching, no re-orientation.
+## Commands
 
-## Consumers
+| Command | Description | Flags |
+|---------|-------------|-------|
+| `digest <file>` | Parse JSONL → digest | `--json`, `--project-dir` |
+| `context [dir]` | Recent digests summary | `--json` |
+| `status` | Cross-project dashboard | `--json` |
+| `fmt` | Format stream-json stdin | |
+| `install` | One-shot setup | `--dry-run` |
+| `cron-curate` | Curate active projects | `--json` |
 
-Once digests exist, anything can consume them:
-
-| Consumer | Trigger | What it does |
-|----------|---------|-------------|
-| Context loader | Session start | "Here's what happened recently" |
-| Doc curator | Periodic/cron | Updates CLAUDE.md, learnings/ |
-| Test writer | After commits | Writes missing tests for changed code |
-| Skill proposer | Weekly | Detects repeated patterns → draft skills |
-| Activity feed | On demand | Cross-project status dashboard |
-| Knowledge transfer | On demand | Propagate gotchas across related projects |
-| Handoff generator | Context limit | Generate continuation prompt |
-
-## Components
+## Files
 
 ```
 sesh/
-├── bin/
-│   └── sesh            # CLI entry point (digest, status, curate)
+├── main.go              # CLI entry, subcommand dispatch
+├── parse.go             # JSONL parser → Session struct
+├── digest.go            # Session → markdown/JSON digest
+├── fmt.go               # stream-json formatter (replaces ralph-fmt)
+├── context.go           # Recent digests → context summary
+├── status.go            # Cross-project dashboard
+├── install.go           # One-shot setup (hooks, gitignore, cron)
+├── cron.go              # Nightly curation orchestrator
+├── *_test.go            # 35 tests
+├── testdata/            # Test fixtures (real JSONL snippets)
 ├── hooks/
-│   └── stop-digest.sh  # Claude Code stop hook → runs sesh digest
-└── README.md
-
-# ralph lives in ~/bin/ (dotfiles) for now — moves here when sesh has an installer
-# ralph           — external agent loop runner
-# ralph-fmt       — stream-json → readable output formatter
+│   ├── stop-digest.sh   # Claude Code Stop hook
+│   └── start-context.sh # Claude Code SessionStart hook
+└── prompts/
+    └── curate.md        # Ralph-compatible curation prompt
 ```
-
-## Dependencies
-
-- Python 3.10+ (standard library only for digest extraction)
-- Claude Code (for hooks integration and session JSONL format)
-- `ralph` (for background curation jobs)
 
 ## Design principles
 
-- **No Claude call in the hot path.** Digest extraction is pure Python. Claude is only used in background curation.
-- **Files are the interface.** Digests are markdown files. Knowledge is markdown files. Everything is readable, greppable, diffable.
+- **No Claude call in the hot path.** Digest extraction is pure Go. Claude is only used in background curation.
+- **Files are the interface.** Digests are markdown files. Everything is readable, greppable, diffable.
 - **Append-only, then curate.** Never modify raw data. Accumulate digests, periodically merge.
-- **Degrade gracefully.** If the stop hook fails, nothing breaks. If curation never runs, digests are still useful on their own.
+- **Degrade gracefully.** If the stop hook fails, nothing breaks. Always exit 0.
+- **`--json` everywhere.** Every subcommand supports structured output.
 
-## Status
+## Dependencies
 
-Vision stage. Components to build:
-
-1. `sesh digest` — session JSONL parser → structured digest
-2. `hooks/stop-digest.sh` — Claude Code stop hook integration
-3. Background curation prompt (a skill that reads digests and curates)
-4. Start hook or CLAUDE.md integration for auto-context
+- Go 1.21+ (standard library only, zero external deps)
+- Claude Code (for hooks integration and session JSONL format)
+- `ralph` (for background curation jobs)
+- `jq` (in hook scripts)
 
 ## Related
 
-- [claude-grep](https://github.com/evoleinik/claude-grep) — regex/semantic search over session transcripts (reactive lookup)
+- [claude-grep](https://github.com/evoleinik/claude-grep) — regex/semantic search over session transcripts
 - `ralph` (`~/bin/ralph`) — external agent loop for autonomous Claude sessions
-- Claude Code hooks — [docs](https://docs.anthropic.com/en/docs/claude-code/hooks)
