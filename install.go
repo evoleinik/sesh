@@ -116,17 +116,22 @@ func installHooks(dryRun bool) []InstallResult {
 		hooks = make(map[string]json.RawMessage)
 	}
 
+	// Resolve symlink to find actual sesh source directory
 	exe, _ := os.Executable()
+	resolved, err := filepath.EvalSymlinks(exe)
+	if err == nil {
+		exe = resolved
+	}
 	seshDir := filepath.Dir(exe)
 
 	// Stop hook
-	stopCmd := "bash " + filepath.Join(seshDir, "..", "src", "sesh", "hooks", "stop-digest.sh")
+	stopCmd := "bash " + filepath.Join(seshDir, "hooks", "stop-digest.sh")
 	stopResult := addHookIfMissing(hooks, "Stop", stopCmd, dryRun)
 	stopResult.Action = "register Stop hook (stop-digest.sh)"
 	results = append(results, stopResult)
 
 	// SessionStart hook
-	startCmd := "bash " + filepath.Join(seshDir, "..", "src", "sesh", "hooks", "start-context.sh")
+	startCmd := "bash " + filepath.Join(seshDir, "hooks", "start-context.sh")
 	startResult := addHookIfMissing(hooks, "SessionStart", startCmd, dryRun)
 	startResult.Action = "register SessionStart hook (start-context.sh)"
 	results = append(results, startResult)
