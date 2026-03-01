@@ -80,12 +80,14 @@ Once digests exist, anything can consume them:
 ```
 sesh/
 ├── bin/
-│   ├── sesh            # CLI entry point
-│   ├── ralph           # external agent loop runner
-│   └── ralph-fmt       # stream-json → readable output formatter
+│   └── sesh            # CLI entry point (digest, status, curate)
 ├── hooks/
 │   └── stop-digest.sh  # Claude Code stop hook → runs sesh digest
 └── README.md
+
+# ralph lives in ~/bin/ (dotfiles) for now — moves here when sesh has an installer
+# ralph           — external agent loop runner
+# ralph-fmt       — stream-json → readable output formatter
 ```
 
 ## Dependencies
