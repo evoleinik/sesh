@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -109,15 +110,17 @@ func ParseSessionReader(r io.Reader) (Session, error) {
 		}
 	}
 
-	// Collect files
+	// Collect files (sorted for deterministic output)
 	for f := range fileSet {
 		s.Files = append(s.Files, f)
 	}
+	sort.Strings(s.Files)
 
-	// Collect commits
+	// Collect commits (sorted for deterministic output)
 	for c := range commitSet {
 		s.Commits = append(s.Commits, c)
 	}
+	sort.Strings(s.Commits)
 
 	return s, nil
 }
@@ -223,6 +226,9 @@ func extractToolResultErrors(content json.RawMessage, s *Session, errorSet *map[
 }
 
 func checkForError(text string, s *Session, errorSet *map[string]bool) {
+	if len(s.Errors) >= 20 {
+		return // already at cap
+	}
 	lines := strings.Split(text, "\n")
 	for _, line := range lines {
 		line = strings.TrimSpace(line)

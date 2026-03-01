@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -118,12 +119,17 @@ func DigestMarkdown(s Session) string {
 		}
 	}
 
-	// Tools
+	// Tools (sorted for deterministic output)
 	if len(s.Tools) > 0 {
 		b.WriteString("\n## Tools\n")
-		toolParts := []string{}
-		for name, count := range s.Tools {
-			toolParts = append(toolParts, fmt.Sprintf("%s: %d", name, count))
+		toolNames := make([]string, 0, len(s.Tools))
+		for name := range s.Tools {
+			toolNames = append(toolNames, name)
+		}
+		sort.Strings(toolNames)
+		toolParts := make([]string, 0, len(toolNames))
+		for _, name := range toolNames {
+			toolParts = append(toolParts, fmt.Sprintf("%s: %d", name, s.Tools[name]))
 		}
 		fmt.Fprintf(&b, "%s\n", strings.Join(toolParts, ", "))
 	}
