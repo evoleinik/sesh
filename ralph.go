@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	_ "embed"
 	"fmt"
 	"io"
 	"os"
@@ -13,6 +14,9 @@ import (
 	"syscall"
 	"time"
 )
+
+//go:embed prompts/ralph-preamble.md
+var defaultPreamble string
 
 // IterResult captures what happened in a single claude iteration.
 type IterResult struct {
@@ -33,20 +37,18 @@ type RalphConfig struct {
 	Stderr     io.Writer // ralph metadata output (default: os.Stderr)
 }
 
-// preamblePath returns the path to the ralph preamble template.
-// Lives next to the sesh source: ~/src/sesh/prompts/ralph-preamble.md
-func preamblePath() string {
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, "src", "sesh", "prompts", "ralph-preamble.md")
-}
-
-// readPreamble reads the preamble template and substitutes placeholders.
+// readPreamble loads the preamble template and substitutes placeholders.
+// Checks ~/src/sesh/prompts/ralph-preamble.md first (hot-editable),
+// falls back to the copy embedded at compile time.
 func readPreamble(iter, max int, stateFile string) string {
-	data, err := os.ReadFile(preamblePath())
-	if err != nil {
-		return fmt.Sprintf("[ERROR: could not read preamble: %s]\n\n", err)
+	home, _ := os.UserHomeDir()
+	override := filepath.Join(home, "src", "sesh", "prompts", "ralph-preamble.md")
+
+	s := defaultPreamble
+	if data, err := os.ReadFile(override); err == nil {
+		s = string(data)
 	}
-	s := string(data)
+
 	s = strings.ReplaceAll(s, "{{ITER}}", strconv.Itoa(iter))
 	s = strings.ReplaceAll(s, "{{MAX}}", strconv.Itoa(max))
 	s = strings.ReplaceAll(s, "{{STATE_FILE}}", stateFile)
