@@ -320,7 +320,8 @@ func generateFallbackState(iter int, stateFile string) {
 	}
 
 	b.WriteString("\n## TODO\n")
-	fmt.Fprintf(&b, "- Review what iteration %d left unfinished (it ran out of context or turns)\n", iter)
+	b.WriteString("- Check git log and git diff for what's unfinished\n")
+	b.WriteString("- If all work is complete, create .ralph-done immediately\n")
 
 	b.WriteString("\n## BLOCKED\n")
 	b.WriteString("- none known\n")
