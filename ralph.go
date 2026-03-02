@@ -33,6 +33,7 @@ type IterResult struct {
 // RalphConfig controls the ralph loop.
 type RalphConfig struct {
 	PromptFile string
+	PromptText string    // inline prompt via -p (used if PromptFile empty)
 	MaxIter    int
 	PlanMode   bool      // use adversarial planning preamble
 	StateFile  string
@@ -68,43 +69,61 @@ func readPreamble(iter, max int, stateFile string, planMode bool) string {
 }
 
 func runRalph(args []string) int {
-	// Parse --plan flag
+	// Parse flags
 	planMode := false
+	promptText := ""
 	var rest []string
-	for _, a := range args {
-		if a == "--plan" {
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--plan":
 			planMode = true
-		} else {
-			rest = append(rest, a)
+		case "-p":
+			i++
+			if i < len(args) {
+				promptText = args[i]
+			} else {
+				fmt.Fprintln(os.Stderr, "sesh ralph: -p requires a value")
+				return 1
+			}
+		default:
+			rest = append(rest, args[i])
 		}
 	}
 
-	if len(rest) < 1 {
-		fmt.Fprintln(os.Stderr, "Usage: sesh ralph [--plan] PROMPT.md [max-iterations]")
+	if promptText == "" && len(rest) < 1 {
+		fmt.Fprintln(os.Stderr, "Usage: sesh ralph [--plan] [-p TEXT] [PROMPT.md] [max-iterations]")
+		fmt.Fprintln(os.Stderr, "  -p TEXT   Inline prompt text (alternative to file)")
 		fmt.Fprintln(os.Stderr, "  --plan    Adversarial plan refinement mode (default 5 iterations)")
 		fmt.Fprintln(os.Stderr, "  Stop: create .ralph-done or hit max iterations")
 		fmt.Fprintln(os.Stderr, "  State: ralph-state.md (read/written each iteration)")
 		return 1
 	}
 
-	promptFile := rest[0]
+	promptFile := ""
+	if promptText == "" {
+		promptFile = rest[0]
+		rest = rest[1:]
+	}
+
 	maxIter := 20
 	if planMode {
 		maxIter = 5
 	}
 
-	if len(rest) >= 2 {
-		n, err := strconv.Atoi(rest[1])
+	if len(rest) >= 1 {
+		n, err := strconv.Atoi(rest[0])
 		if err != nil || n < 1 {
-			fmt.Fprintf(os.Stderr, "sesh ralph: invalid max-iterations: %q\n", rest[1])
+			fmt.Fprintf(os.Stderr, "sesh ralph: invalid max-iterations: %q\n", rest[0])
 			return 1
 		}
 		maxIter = n
 	}
 
-	if _, err := os.Stat(promptFile); os.IsNotExist(err) {
-		fmt.Fprintf(os.Stderr, "sesh ralph: prompt file not found: %s\n", promptFile)
-		return 1
+	if promptFile != "" {
+		if _, err := os.Stat(promptFile); os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "sesh ralph: prompt file not found: %s\n", promptFile)
+			return 1
+		}
 	}
 
 	initTelemetry()
@@ -116,6 +135,7 @@ func runRalph(args []string) int {
 
 	cfg := RalphConfig{
 		PromptFile: promptFile,
+		PromptText: promptText,
 		MaxIter:    maxIter,
 		PlanMode:   planMode,
 		StateFile:  "ralph-state.md",
@@ -155,7 +175,14 @@ func Ralph(cfg RalphConfig, ev *Event) int {
 	if cfg.PlanMode {
 		mode = "plan"
 	}
-	fmt.Fprintf(cfg.Stderr, "ralph: prompt=%s max=%d mode=%s cwd=%s\n", cfg.PromptFile, cfg.MaxIter, mode, cwd)
+	label := cfg.PromptFile
+	if label == "" {
+		label = cfg.PromptText
+		if len(label) > 60 {
+			label = label[:60] + "..."
+		}
+	}
+	fmt.Fprintf(cfg.Stderr, "ralph: prompt=%s max=%d mode=%s cwd=%s\n", label, cfg.MaxIter, mode, cwd)
 	fmt.Fprintf(cfg.Stderr, "ralph: started at %s\n\n", time.Now().Format("2006-01-02 15:04:05"))
 
 	lastHead := gitHead()
@@ -174,7 +201,7 @@ func Ralph(cfg RalphConfig, ev *Event) int {
 
 		killStaleServers()
 
-		prompt := buildPrompt(i, cfg.MaxIter, cfg.StateFile, cfg.PromptFile, stallCount, cfg.PlanMode)
+		prompt := buildPrompt(i, cfg.MaxIter, cfg.StateFile, cfg.PromptFile, cfg.PromptText, stallCount, cfg.PlanMode)
 		result := RunIteration(ctx, prompt, cfg.Stdout)
 
 		// stall detection: did git HEAD change?
@@ -281,7 +308,7 @@ func RunIteration(ctx context.Context, prompt string, w io.Writer) IterResult {
 	return result
 }
 
-func buildPrompt(iter, max int, stateFile, promptFile string, stallCount int, planMode bool) string {
+func buildPrompt(iter, max int, stateFile, promptFile, promptText string, stallCount int, planMode bool) string {
 	var b strings.Builder
 
 	// preamble (read from disk each iteration — editable without rebuild)
@@ -306,11 +333,15 @@ Do NOT re-audit. Do NOT start a server. Do NOT take screenshots.
 	}
 
 	// user prompt
-	content, err := os.ReadFile(promptFile)
-	if err != nil {
-		fmt.Fprintf(&b, "[ERROR: could not read prompt file: %s]\n", err)
+	if promptFile != "" {
+		content, err := os.ReadFile(promptFile)
+		if err != nil {
+			fmt.Fprintf(&b, "[ERROR: could not read prompt file: %s]\n", err)
+		} else {
+			b.Write(content)
+		}
 	} else {
-		b.Write(content)
+		b.WriteString(promptText)
 	}
 
 	// state file appended last (recency bias)

@@ -16,7 +16,7 @@ func TestBuildPrompt(t *testing.T) {
 	os.WriteFile(promptFile, []byte("Do the thing.\n"), 0644)
 	os.WriteFile(stateFile, []byte("# Ralph State\n\n## DONE\n- step 1\n"), 0644)
 
-	got := buildPrompt(3, 10, stateFile, promptFile, 0, false)
+	got := buildPrompt(3, 10, stateFile, promptFile, "", 0, false)
 
 	if !strings.Contains(got, "iteration 3 of 10") {
 		t.Error("prompt should contain iteration number")
@@ -46,7 +46,7 @@ func TestBuildPromptNoState(t *testing.T) {
 
 	os.WriteFile(promptFile, []byte("Do the thing.\n"), 0644)
 
-	got := buildPrompt(1, 5, stateFile, promptFile, 0, false)
+	got := buildPrompt(1, 5, stateFile, promptFile, "", 0, false)
 
 	if strings.Contains(got, "## CURRENT STATE — READ THIS FIRST") {
 		t.Error("prompt should NOT contain state section when file absent")
@@ -62,13 +62,13 @@ func TestBuildPromptStallWarning(t *testing.T) {
 	os.WriteFile(promptFile, []byte("Do the thing.\n"), 0644)
 
 	// No stall warning at stallCount < 3
-	got := buildPrompt(5, 10, filepath.Join(dir, "state.md"), promptFile, 2, false)
+	got := buildPrompt(5, 10, filepath.Join(dir, "state.md"), promptFile, "", 2, false)
 	if strings.Contains(got, "STALL DETECTED") {
 		t.Error("should NOT show stall warning at stallCount=2")
 	}
 
 	// Stall warning at stallCount >= 3
-	got = buildPrompt(5, 10, filepath.Join(dir, "state.md"), promptFile, 3, false)
+	got = buildPrompt(5, 10, filepath.Join(dir, "state.md"), promptFile, "", 3, false)
 	if !strings.Contains(got, "STALL DETECTED") {
 		t.Error("should show stall warning at stallCount=3")
 	}
@@ -82,7 +82,7 @@ func TestBuildPromptPlanMode(t *testing.T) {
 	promptFile := filepath.Join(dir, "plan.md")
 	os.WriteFile(promptFile, []byte("# My Plan\n\nDo X then Y.\n"), 0644)
 
-	got := buildPrompt(2, 5, filepath.Join(dir, "state.md"), promptFile, 0, true)
+	got := buildPrompt(2, 5, filepath.Join(dir, "state.md"), promptFile, "", 0, true)
 
 	// Should use plan preamble, not execution preamble
 	if !strings.Contains(got, "Planning Loop") {
@@ -147,6 +147,26 @@ func TestRunRalphBadArgs(t *testing.T) {
 	code = runRalph([]string{f, "0"})
 	if code != 1 {
 		t.Errorf("zero max: got exit %d, want 1", code)
+	}
+
+	// -p without value
+	code = runRalph([]string{"-p"})
+	if code != 1 {
+		t.Errorf("-p without value: got exit %d, want 1", code)
+	}
+}
+
+func TestBuildPromptInline(t *testing.T) {
+	dir := t.TempDir()
+	stateFile := filepath.Join(dir, "ralph-state.md")
+
+	got := buildPrompt(1, 3, stateFile, "", "Build a REST API", 0, false)
+
+	if !strings.Contains(got, "Build a REST API") {
+		t.Error("prompt should contain inline text")
+	}
+	if !strings.Contains(got, "iteration 1 of 3") {
+		t.Error("prompt should contain iteration number")
 	}
 }
 
