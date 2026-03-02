@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 )
 
@@ -22,7 +23,7 @@ func runFmt(args []string) int {
 }
 
 // FormatStream reads stream-json events from r and writes formatted output to w.
-func FormatStream(r *os.File, w *os.File) {
+func FormatStream(r io.Reader, w io.Writer) {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 256*1024), 1024*1024)
 

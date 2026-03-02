@@ -51,14 +51,14 @@ Single Go binary, no external dependencies, ~60ms on a 5MB session.
 
 ### Layer 2 → 3: Knowledge curation (background)
 
-Nightly cron runs `ralph` with the curation prompt on each active project:
+Nightly cron runs `sesh ralph` (in-process) with the curation prompt on each active project:
 
 - Merge duplicate gotchas across sessions
 - Promote recurring patterns into rules
 - Prune one-time issues that didn't recur
 - Detect documentation gaps
 
-Run manually: `cd PROJECT && ralph ~/src/sesh/prompts/curate.md 1`
+Run manually: `cd PROJECT && sesh ralph ~/src/sesh/prompts/curate.md 1`
 
 ### Layer 3 → New sessions: Auto-context
 
@@ -72,6 +72,7 @@ SessionStart hook injects recent session context into Claude's system prompt.
 | `context [dir]` | Recent digests summary | `--json` |
 | `status` | Cross-project dashboard | `--json` |
 | `fmt` | Format stream-json stdin | |
+| `ralph PROMPT.md [N]` | Run agent loop (N iterations, default 20) | |
 | `install` | One-shot setup | `--dry-run` |
 | `cron-curate` | Curate active projects | `--json` |
 | `doctor` | System health check | `--json` |
@@ -92,6 +93,7 @@ sesh/
 ├── context.go           # Recent digests → context summary
 ├── status.go            # Cross-project dashboard
 ├── install.go           # One-shot setup (hooks, gitignore, cron)
+├── ralph.go             # Agent loop (iteration + loop control)
 ├── cron.go              # Nightly curation orchestrator
 ├── telemetry.go         # Event struct, emit() → sesh-events.jsonl
 ├── doctor.go            # System health check
@@ -116,10 +118,9 @@ sesh/
 
 - Go 1.21+ (standard library only, zero external deps)
 - Claude Code (for hooks integration and session JSONL format)
-- `ralph` (for background curation jobs)
 - `jq` (in hook scripts)
 
 ## Related
 
 - [claude-grep](https://github.com/evoleinik/claude-grep) — regex/semantic search over session transcripts
-- `ralph` (`~/bin/ralph`) — external agent loop for autonomous Claude sessions
+- `sesh ralph` — built-in agent loop (ported from `~/bin/ralph`)

@@ -27,6 +27,8 @@ type Event struct {
 	StepsOK     int    `json:"steps_ok,omitempty"`
 	StepsSkip   int    `json:"steps_skip,omitempty"`
 	StepsFail   int    `json:"steps_fail,omitempty"`
+	Iterations  int    `json:"iterations,omitempty"`
+	RalphDone   bool   `json:"ralph_done,omitempty"`
 }
 
 var telemetryStart time.Time

@@ -18,6 +18,7 @@ Commands:
   status                   Cross-project activity dashboard
   fmt                      Format stream-json from stdin
   install                  One-shot setup (hooks, gitignore, cron)
+  ralph PROMPT.md [N]      Run agent loop (N iterations, default 20)
   cron-curate              Curate projects with new digests
   doctor                   System health check
 
@@ -53,6 +54,8 @@ func run() int {
 		return runStatus(os.Args[2:])
 	case "fmt":
 		return runFmt(os.Args[2:])
+	case "ralph":
+		return runRalph(os.Args[2:])
 	case "install":
 		return runInstall(os.Args[2:])
 	case "cron-curate":

@@ -5,7 +5,6 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -172,10 +171,19 @@ func runCuration(projectDir string) error {
 		return fmt.Errorf("curate prompt not found: %s", promptPath)
 	}
 
-	cmd := exec.Command("ralph", promptPath, "1")
-	cmd.Dir = projectDir
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	origDir, _ := os.Getwd()
+	if err := os.Chdir(projectDir); err != nil {
+		return fmt.Errorf("chdir %s: %w", projectDir, err)
+	}
+	defer os.Chdir(origDir)
 
-	return cmd.Run()
+	cfg := RalphConfig{
+		PromptFile: promptPath,
+		MaxIter:    1,
+	}
+	code := Ralph(cfg, nil)
+	if code != 0 {
+		return fmt.Errorf("ralph exited %d", code)
+	}
+	return nil
 }
