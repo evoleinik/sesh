@@ -18,7 +18,7 @@ Commands:
   status                   Cross-project activity dashboard
   fmt                      Format stream-json from stdin
   install                  One-shot setup (hooks, gitignore, cron)
-  ralph PROMPT.md [N]      Run agent loop (N iterations, default 20)
+  ralph [--plan] PROMPT [N] Run agent loop (--plan: adversarial refinement)
   cron-curate              Curate projects with new digests
   doctor                   System health check
 

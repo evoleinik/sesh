@@ -18,6 +18,9 @@ import (
 //go:embed prompts/ralph-preamble.md
 var defaultPreamble string
 
+//go:embed prompts/ralph-plan-preamble.md
+var defaultPlanPreamble string
+
 // IterResult captures what happened in a single claude iteration.
 type IterResult struct {
 	ExitCode    int
@@ -31,6 +34,7 @@ type IterResult struct {
 type RalphConfig struct {
 	PromptFile string
 	MaxIter    int
+	PlanMode   bool      // use adversarial planning preamble
 	StateFile  string
 	DoneFile   string
 	Stdout     io.Writer // FormatStream output (default: os.Stdout)
@@ -38,13 +42,21 @@ type RalphConfig struct {
 }
 
 // readPreamble loads the preamble template and substitutes placeholders.
-// Checks ~/src/sesh/prompts/ralph-preamble.md first (hot-editable),
-// falls back to the copy embedded at compile time.
-func readPreamble(iter, max int, stateFile string) string {
+// Checks ~/src/sesh/prompts/ first (hot-editable), falls back to embedded copy.
+func readPreamble(iter, max int, stateFile string, planMode bool) string {
 	home, _ := os.UserHomeDir()
-	override := filepath.Join(home, "src", "sesh", "prompts", "ralph-preamble.md")
 
-	s := defaultPreamble
+	var embedded, filename string
+	if planMode {
+		embedded = defaultPlanPreamble
+		filename = "ralph-plan-preamble.md"
+	} else {
+		embedded = defaultPreamble
+		filename = "ralph-preamble.md"
+	}
+
+	override := filepath.Join(home, "src", "sesh", "prompts", filename)
+	s := embedded
 	if data, err := os.ReadFile(override); err == nil {
 		s = string(data)
 	}
@@ -56,20 +68,35 @@ func readPreamble(iter, max int, stateFile string) string {
 }
 
 func runRalph(args []string) int {
-	if len(args) < 1 {
-		fmt.Fprintln(os.Stderr, "Usage: sesh ralph PROMPT.md [max-iterations]")
+	// Parse --plan flag
+	planMode := false
+	var rest []string
+	for _, a := range args {
+		if a == "--plan" {
+			planMode = true
+		} else {
+			rest = append(rest, a)
+		}
+	}
+
+	if len(rest) < 1 {
+		fmt.Fprintln(os.Stderr, "Usage: sesh ralph [--plan] PROMPT.md [max-iterations]")
+		fmt.Fprintln(os.Stderr, "  --plan    Adversarial plan refinement mode (default 5 iterations)")
 		fmt.Fprintln(os.Stderr, "  Stop: create .ralph-done or hit max iterations")
 		fmt.Fprintln(os.Stderr, "  State: ralph-state.md (read/written each iteration)")
 		return 1
 	}
 
-	promptFile := args[0]
+	promptFile := rest[0]
 	maxIter := 20
+	if planMode {
+		maxIter = 5
+	}
 
-	if len(args) >= 2 {
-		n, err := strconv.Atoi(args[1])
+	if len(rest) >= 2 {
+		n, err := strconv.Atoi(rest[1])
 		if err != nil || n < 1 {
-			fmt.Fprintf(os.Stderr, "sesh ralph: invalid max-iterations: %q\n", args[1])
+			fmt.Fprintf(os.Stderr, "sesh ralph: invalid max-iterations: %q\n", rest[1])
 			return 1
 		}
 		maxIter = n
@@ -82,11 +109,15 @@ func runRalph(args []string) int {
 
 	initTelemetry()
 	ev := Event{Cmd: "ralph", OK: true}
+	if planMode {
+		ev.Cmd = "ralph-plan"
+	}
 	defer func() { emit(ev) }()
 
 	cfg := RalphConfig{
 		PromptFile: promptFile,
 		MaxIter:    maxIter,
+		PlanMode:   planMode,
 		StateFile:  "ralph-state.md",
 		DoneFile:   ".ralph-done",
 		Stdout:     os.Stdout,
@@ -120,7 +151,11 @@ func Ralph(cfg RalphConfig, ev *Event) int {
 	defer stop()
 
 	cwd, _ := os.Getwd()
-	fmt.Fprintf(cfg.Stderr, "ralph: prompt=%s max=%d cwd=%s\n", cfg.PromptFile, cfg.MaxIter, cwd)
+	mode := "execute"
+	if cfg.PlanMode {
+		mode = "plan"
+	}
+	fmt.Fprintf(cfg.Stderr, "ralph: prompt=%s max=%d mode=%s cwd=%s\n", cfg.PromptFile, cfg.MaxIter, mode, cwd)
 	fmt.Fprintf(cfg.Stderr, "ralph: started at %s\n\n", time.Now().Format("2006-01-02 15:04:05"))
 
 	lastHead := gitHead()
@@ -139,7 +174,7 @@ func Ralph(cfg RalphConfig, ev *Event) int {
 
 		killStaleServers()
 
-		prompt := buildPrompt(i, cfg.MaxIter, cfg.StateFile, cfg.PromptFile, stallCount)
+		prompt := buildPrompt(i, cfg.MaxIter, cfg.StateFile, cfg.PromptFile, stallCount, cfg.PlanMode)
 		result := RunIteration(ctx, prompt, cfg.Stdout)
 
 		// stall detection: did git HEAD change?
@@ -246,11 +281,11 @@ func RunIteration(ctx context.Context, prompt string, w io.Writer) IterResult {
 	return result
 }
 
-func buildPrompt(iter, max int, stateFile, promptFile string, stallCount int) string {
+func buildPrompt(iter, max int, stateFile, promptFile string, stallCount int, planMode bool) string {
 	var b strings.Builder
 
 	// preamble (read from disk each iteration — editable without rebuild)
-	b.WriteString(readPreamble(iter, max, stateFile))
+	b.WriteString(readPreamble(iter, max, stateFile, planMode))
 	b.WriteString("\n")
 
 	// stall warning injected after preamble, before user prompt

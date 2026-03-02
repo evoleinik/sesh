@@ -72,7 +72,7 @@ SessionStart hook injects recent session context into Claude's system prompt.
 | `context [dir]` | Recent digests summary | `--json` |
 | `status` | Cross-project dashboard | `--json` |
 | `fmt` | Format stream-json stdin | |
-| `ralph PROMPT.md [N]` | Run agent loop (N iterations, default 20) | |
+| `ralph [--plan] PROMPT [N]` | Run agent loop | `--plan` (adversarial refinement, default 5 iter) |
 | `install` | One-shot setup | `--dry-run` |
 | `cron-curate` | Curate active projects | `--json` |
 | `doctor` | System health check | `--json` |
@@ -104,7 +104,8 @@ sesh/
 │   └── start-context.sh # Claude Code SessionStart hook
 └── prompts/
     ├── curate.md        # Ralph-compatible curation prompt
-    └── ralph-preamble.md # Iteration preamble (embedded; hot-reloadable from disk)
+    ├── ralph-preamble.md      # Execution preamble (embedded; hot-reloadable)
+    └── ralph-plan-preamble.md # Planning preamble (embedded; hot-reloadable)
 ```
 
 ## Design principles
