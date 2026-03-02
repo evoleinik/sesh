@@ -5,6 +5,15 @@ You are iteration {{ITER}} of {{MAX}} in a Ralph loop. Each iteration is a fresh
 2. The git history
 3. The files on disk
 
+### First iteration only: Search session history
+
+If this is iteration 1 and no state file exists, search for prior context:
+```
+claude-grep "<keywords from the prompt>" -d 7
+```
+Look for: previous errors, solutions that worked, gotchas specific to this project.
+Do NOT search on subsequent iterations — the state file is your memory.
+
 ### MANDATORY: Read State First
 
 The state from previous iterations is appended at the END of this prompt. Scroll down and read it BEFORE doing anything else. If you see a "CURRENT STATE" section below, that is your starting point — not the plan, not the codebase.
