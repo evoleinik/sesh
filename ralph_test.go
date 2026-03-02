@@ -16,7 +16,7 @@ func TestBuildPrompt(t *testing.T) {
 	os.WriteFile(promptFile, []byte("Do the thing.\n"), 0644)
 	os.WriteFile(stateFile, []byte("# Ralph State\n\n## DONE\n- step 1\n"), 0644)
 
-	got := buildPrompt(3, 10, stateFile, promptFile)
+	got := buildPrompt(3, 10, stateFile, promptFile, 0)
 
 	if !strings.Contains(got, "iteration 3 of 10") {
 		t.Error("prompt should contain iteration number")
@@ -46,13 +46,34 @@ func TestBuildPromptNoState(t *testing.T) {
 
 	os.WriteFile(promptFile, []byte("Do the thing.\n"), 0644)
 
-	got := buildPrompt(1, 5, stateFile, promptFile)
+	got := buildPrompt(1, 5, stateFile, promptFile, 0)
 
 	if strings.Contains(got, "## CURRENT STATE — READ THIS FIRST") {
 		t.Error("prompt should NOT contain state section when file absent")
 	}
 	if !strings.Contains(got, "Do the thing.") {
 		t.Error("prompt should still contain user prompt")
+	}
+}
+
+func TestBuildPromptStallWarning(t *testing.T) {
+	dir := t.TempDir()
+	promptFile := filepath.Join(dir, "prompt.md")
+	os.WriteFile(promptFile, []byte("Do the thing.\n"), 0644)
+
+	// No stall warning at stallCount < 3
+	got := buildPrompt(5, 10, filepath.Join(dir, "state.md"), promptFile, 2)
+	if strings.Contains(got, "STALL DETECTED") {
+		t.Error("should NOT show stall warning at stallCount=2")
+	}
+
+	// Stall warning at stallCount >= 3
+	got = buildPrompt(5, 10, filepath.Join(dir, "state.md"), promptFile, 3)
+	if !strings.Contains(got, "STALL DETECTED") {
+		t.Error("should show stall warning at stallCount=3")
+	}
+	if !strings.Contains(got, "3 consecutive iterations") {
+		t.Error("stall warning should mention count")
 	}
 }
 

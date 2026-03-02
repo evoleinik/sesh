@@ -166,6 +166,9 @@ func Ralph(cfg RalphConfig, ev *Event) int {
 	fmt.Fprintf(cfg.Stderr, "ralph: prompt=%s max=%d cwd=%s\n", cfg.PromptFile, cfg.MaxIter, cwd)
 	fmt.Fprintf(cfg.Stderr, "ralph: started at %s\n\n", time.Now().Format("2006-01-02 15:04:05"))
 
+	lastHead := gitHead()
+	stallCount := 0
+
 	for i := 1; i <= cfg.MaxIter; i++ {
 		if ctx.Err() != nil {
 			fmt.Fprintf(cfg.Stderr, "\n=== interrupted ===\n")
@@ -179,8 +182,20 @@ func Ralph(cfg RalphConfig, ev *Event) int {
 
 		killStaleServers()
 
-		prompt := buildPrompt(i, cfg.MaxIter, cfg.StateFile, cfg.PromptFile)
+		prompt := buildPrompt(i, cfg.MaxIter, cfg.StateFile, cfg.PromptFile, stallCount)
 		result := RunIteration(ctx, prompt, cfg.Stdout)
+
+		// stall detection: did git HEAD change?
+		head := gitHead()
+		if head == lastHead {
+			stallCount++
+			if stallCount >= 3 {
+				fmt.Fprintf(cfg.Stderr, "ralph: WARNING — %d consecutive iterations with no commits\n", stallCount)
+			}
+		} else {
+			stallCount = 0
+			lastHead = head
+		}
 
 		printIterSummary(cfg.Stderr, i, result, time.Since(loopStart))
 
@@ -274,11 +289,28 @@ func RunIteration(ctx context.Context, prompt string, w io.Writer) IterResult {
 	return result
 }
 
-func buildPrompt(iter, max int, stateFile, promptFile string) string {
+func buildPrompt(iter, max int, stateFile, promptFile string, stallCount int) string {
 	var b strings.Builder
 
 	// preamble
 	fmt.Fprintf(&b, preambleTmpl, iter, max, stateFile, stateFile, stateFile, iter)
+
+	// stall warning injected after preamble, before user prompt
+	if stallCount >= 3 {
+		fmt.Fprintf(&b, `
+### ⚠ STALL DETECTED — %d consecutive iterations with zero commits
+
+Previous iterations explored the codebase but changed nothing. You MUST either:
+1. **Create .ralph-done** if all work is complete (including if remaining items are BLOCKED)
+2. **Make a concrete code change and commit it** — not audit, not explore, not review
+
+If the TODO is empty and BLOCKED items require user action, create .ralph-done NOW.
+Do NOT re-audit. Do NOT start a server. Do NOT take screenshots.
+
+---
+
+`, stallCount)
+	}
 
 	// user prompt
 	content, err := os.ReadFile(promptFile)
@@ -297,6 +329,14 @@ func buildPrompt(iter, max int, stateFile, promptFile string) string {
 	}
 
 	return b.String()
+}
+
+func gitHead() string {
+	out, err := exec.Command("git", "rev-parse", "HEAD").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
 }
 
 func killStaleServers() {
