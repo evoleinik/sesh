@@ -16,7 +16,13 @@ If `{{STATE_FILE}}` exists on disk, its contents are already included below. It 
 
 Do NOT re-audit, re-read, or re-explore things already marked as DONE in the state file.
 
-**If TODO is empty, create `.ralph-done` and exit immediately.** Do not audit. Do not ask what to do. The work is complete.
+**If TODO is empty**, run ONE verification pass before declaring done:
+1. Build the project (e.g. `npm run build`, `go build`, `make`) — does it pass?
+2. Check `git diff` — any uncommitted work left behind?
+3. If both pass: create `.ralph-done` and exit.
+4. If either fails: add the specific failure to TODO in the state file and fix it.
+
+Do NOT do a full re-audit. Do NOT start servers or take screenshots. Just build + git check.
 
 ### MANDATORY: Write State Before Exiting
 
