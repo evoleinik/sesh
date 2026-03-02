@@ -5,34 +5,67 @@ Based on the Ralph Wiggum technique by Geoffrey Huntley.
 
 ## Location
 
-`~/bin/ralph` and `~/bin/ralph-fmt` (dotfiles repo). Will move to sesh when it has an installer.
+Built into `sesh` — run as `sesh ralph PROMPT.md [N]`. No external binary needed.
+
+The preamble template lives at `prompts/ralph-preamble.md` (embedded in the binary at build time). If `~/src/sesh/prompts/ralph-preamble.md` exists on disk, it is used instead — hot-editable without rebuild or loop restart.
 
 ## Usage
 
 ```bash
-ralph PROMPT.md              # run loop (default 20 iterations)
-ralph PROMPT.md 50           # custom max iterations
+sesh ralph PROMPT.md              # run loop (default 20 iterations)
+sesh ralph PROMPT.md 50           # custom max iterations
 ```
 
 ## How it works
 
 Each iteration:
-1. Reads PROMPT.md
-2. Runs `claude -p` with fresh context (no conversation history)
-3. Claude sees its own prior work through files and git history
-4. Prints streaming text + tool call indicators via `ralph-fmt`
-5. Shows iteration summary (duration, git diff stats, last commit)
+1. Reads `ralph-preamble.md` (disk override if present, else embedded)
+2. Appends stall warning if 3+ consecutive no-commit iterations
+3. Appends user `PROMPT.md`
+4. Appends `ralph-state.md` (agent's memory from prior iterations)
+5. Runs `claude -p` with fresh context (`--dangerously-skip-permissions`, `--max-turns 50`)
+6. Formats stream-json output in-process via `FormatStream()`
+7. Prints iteration summary (duration, git diff stats, last commit, state file presence)
 
 Stop conditions:
-- Claude creates `.ralph-done` file
-- Max iterations reached
-- Ctrl+C (trapped cleanly)
+- Agent creates `.ralph-done` file
+- Max iterations reached (exit 1)
+- Ctrl+C / SIGTERM (exit 130)
 
-## Flags
+## State file
+
+`ralph-state.md` is the agent's cross-iteration memory:
+
+```markdown
+# Ralph State (updated by iteration N)
+
+## DONE
+## TODO
+## BLOCKED
+## NOTES
+## LEARNINGS (append-only)
+```
+
+If the agent fails to write state, a fallback is auto-generated from `git log` and `git diff`.
+
+## Stall detection
+
+After 3+ consecutive iterations with no new commits, a warning is injected into the prompt. The agent is forced to either commit or create `.ralph-done`.
+
+## Verify before done
+
+When TODO is empty, the preamble requires a one-pass verification before signaling completion:
+1. Build the project (`go build`, `npm run build`, etc.)
+2. Check `git diff` for uncommitted work
+3. Only then create `.ralph-done`
+
+This prevents premature exit when state says "done" but the build is broken.
+
+## Flags passed to claude
 
 - `--dangerously-skip-permissions` — no permission prompts
 - `--max-turns 50` — safety cap per iteration
-- `--verbose --output-format stream-json` — piped through `ralph-fmt`
+- `--verbose --output-format stream-json` — piped through `FormatStream`
 
 ## FEEDBACK.md pattern
 
@@ -53,8 +86,8 @@ Next iteration reads it, acts on it, clears it. Prompt stays stable.
 Any skill can be run as a one-shot ralph loop:
 
 ```bash
-ralph ~/.claude/skills/curate-docs/SKILL.md 1
-ralph ~/.claude/skills/curate-tests/SKILL.md 1
+sesh ralph ~/.claude/skills/curate-docs/SKILL.md 1
+sesh ralph ~/.claude/skills/curate-tests/SKILL.md 1
 ```
 
 This is the foundation for background housekeeping — cron fires ralph with a skill.
@@ -73,4 +106,10 @@ When using `--verbose --output-format stream-json`, events have this structure:
 {"type": "result", ...}
 ```
 
-`ralph-fmt` extracts text blocks (streamed to stdout) and tool_use blocks (shown as dimmed `▶ ToolName  detail` lines). Consecutive tool calls are compact; blank lines only on text↔tool transitions.
+`FormatStream()` extracts text blocks (streamed to stdout) and tool_use blocks (shown as dimmed `▶ ToolName  detail` lines). Consecutive tool calls are compact; blank lines only on text↔tool transitions.
+
+## Preamble hot-reload
+
+The preamble (`prompts/ralph-preamble.md`) is re-read from disk at the start of every iteration. Edit it while a loop is running — the next iteration picks up the change immediately. No rebuild, no restart.
+
+Placeholders: `{{ITER}}`, `{{MAX}}`, `{{STATE_FILE}}`

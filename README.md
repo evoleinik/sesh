@@ -103,7 +103,8 @@ sesh/
 │   ├── stop-digest.sh   # Claude Code Stop hook
 │   └── start-context.sh # Claude Code SessionStart hook
 └── prompts/
-    └── curate.md        # Ralph-compatible curation prompt
+    ├── curate.md        # Ralph-compatible curation prompt
+    └── ralph-preamble.md # Iteration preamble (embedded; hot-reloadable from disk)
 ```
 
 ## Design principles
@@ -123,4 +124,4 @@ sesh/
 ## Related
 
 - [claude-grep](https://github.com/evoleinik/claude-grep) — regex/semantic search over session transcripts
-- `sesh ralph` — built-in agent loop (ported from `~/bin/ralph`)
+- `sesh ralph` — built-in agent loop; see [docs/ralph.md](docs/ralph.md) for full reference
