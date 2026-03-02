@@ -72,7 +72,7 @@ SessionStart hook injects recent session context into Claude's system prompt.
 | `context [dir]` | Recent digests summary | `--json` |
 | `status` | Cross-project dashboard | `--json` |
 | `fmt` | Format stream-json stdin | |
-| `ralph [--plan] PROMPT [N]` | Run agent loop | `--plan` (adversarial refinement, default 5 iter) |
+| `ralph [--plan] [-p TEXT] [FILE] [N]` | Run agent loop | `--plan` (adversarial refinement, default 5 iter), `-p` (inline prompt) |
 | `install` | One-shot setup | `--dry-run` |
 | `cron-curate` | Curate active projects | `--json` |
 | `doctor` | System health check | `--json` |

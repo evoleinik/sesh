@@ -5,7 +5,7 @@ Based on the Ralph Wiggum technique by Geoffrey Huntley.
 
 ## Location
 
-Built into `sesh` — run as `sesh ralph PROMPT.md [N]`. No external binary needed.
+Built into `sesh` — run as `sesh ralph PROMPT.md [N]` or `sesh ralph -p "text" [N]`. No external binary needed.
 
 The preamble template lives at `prompts/ralph-preamble.md` (embedded in the binary at build time). If `~/src/sesh/prompts/ralph-preamble.md` exists on disk, it is used instead — hot-editable without rebuild or loop restart.
 
@@ -14,6 +14,8 @@ The preamble template lives at `prompts/ralph-preamble.md` (embedded in the bina
 ```bash
 sesh ralph PROMPT.md              # run loop (default 20 iterations)
 sesh ralph PROMPT.md 50           # custom max iterations
+sesh ralph -p "Build a REST API"  # inline prompt (no file needed)
+sesh ralph --plan -p "Design X"   # plan mode + inline
 ```
 
 ## How it works
