@@ -337,11 +337,9 @@ func RunIteration(ctx context.Context, prompt string, maxTurns int, extraEnv []s
 		cmd.Env = append(os.Environ(), extraEnv...)
 	}
 	cmd.Stderr = os.Stderr
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Cancel = func() error {
-		return syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
-	}
-	cmd.WaitDelay = 3 * time.Second
+	// No Setpgid — child shares our process group so terminal Ctrl+C
+	// sends SIGINT to both sesh and claude directly.
+	cmd.WaitDelay = 5 * time.Second
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
