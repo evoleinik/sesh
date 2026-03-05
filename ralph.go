@@ -343,10 +343,18 @@ func RunIteration(ctx context.Context, prompt string, maxTurns int, extraEnv []s
 	if len(extraEnv) > 0 {
 		cmd.Env = append(os.Environ(), extraEnv...)
 	}
-	cmd.Stderr = os.Stderr
-	// No Setpgid — child shares our process group so terminal Ctrl+C
-	// sends SIGINT to both sesh and claude directly.
-	cmd.WaitDelay = 5 * time.Second
+	// Pipe stderr instead of giving claude the terminal fd directly.
+	// If claude gets a real tty, it sets raw mode and Ctrl+C becomes
+	// byte 0x03 instead of SIGINT — making the process unkillable.
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		return IterResult{ExitCode: 1, Duration: time.Since(start)}
+	}
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
+	cmd.WaitDelay = 3 * time.Second
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -357,9 +365,12 @@ func RunIteration(ctx context.Context, prompt string, maxTurns int, extraEnv []s
 		return IterResult{ExitCode: 1, Duration: time.Since(start)}
 	}
 
-	// Run FormatStream in a goroutine so cmd.Wait() isn't blocked behind it.
-	// Without this, context cancellation sends SIGTERM but FormatStream keeps
-	// reading the pipe, preventing Wait() from running WaitDelay → SIGKILL.
+	// Forward stderr in background
+	go func() {
+		io.Copy(os.Stderr, stderrPipe)
+	}()
+
+	// FormatStream in goroutine so cmd.Wait() isn't blocked behind pipe reads
 	doneFmt := make(chan struct{})
 	go func() {
 		FormatStream(stdout, w)
@@ -367,7 +378,7 @@ func RunIteration(ctx context.Context, prompt string, maxTurns int, extraEnv []s
 	}()
 
 	waitErr := cmd.Wait()
-	<-doneFmt // ensure FormatStream finishes before we return
+	<-doneFmt
 	dur := time.Since(start)
 
 	result := IterResult{Duration: dur}
