@@ -213,6 +213,12 @@ func Ralph(cfg RalphConfig, ev *Event) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// After first Ctrl+C cancels ctx, restore default handler so second Ctrl+C hard-kills
+	go func() {
+		<-ctx.Done()
+		signal.Reset(os.Interrupt, syscall.SIGTERM)
+	}()
+
 	cwd, _ := os.Getwd()
 	mode := "execute"
 	if cfg.PlanMode {
@@ -346,9 +352,17 @@ func RunIteration(ctx context.Context, prompt string, maxTurns int, extraEnv []s
 		return IterResult{ExitCode: 1, Duration: time.Since(start)}
 	}
 
-	FormatStream(stdout, w)
+	// Run FormatStream in a goroutine so cmd.Wait() isn't blocked behind it.
+	// Without this, context cancellation sends SIGTERM but FormatStream keeps
+	// reading the pipe, preventing Wait() from running WaitDelay → SIGKILL.
+	doneFmt := make(chan struct{})
+	go func() {
+		FormatStream(stdout, w)
+		close(doneFmt)
+	}()
 
 	waitErr := cmd.Wait()
+	<-doneFmt // ensure FormatStream finishes before we return
 	dur := time.Since(start)
 
 	result := IterResult{Duration: dur}
