@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	_ "embed"
 	"fmt"
@@ -35,7 +36,9 @@ type RalphConfig struct {
 	PromptFile string
 	PromptText string    // inline prompt via -p (used if PromptFile empty)
 	MaxIter    int
+	MaxTurns   int       // Claude Code --max-turns per iteration (default 100)
 	PlanMode   bool      // use adversarial planning preamble
+	EnvFile    string    // .env file to source before each iteration
 	StateFile  string
 	DoneFile   string
 	Stdout     io.Writer // FormatStream output (default: os.Stdout)
@@ -72,6 +75,8 @@ func runRalph(args []string) int {
 	// Parse flags
 	planMode := false
 	promptText := ""
+	envFile := ""
+	maxTurns := 100
 	var rest []string
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
@@ -85,24 +90,50 @@ func runRalph(args []string) int {
 				fmt.Fprintln(os.Stderr, "sesh ralph: -p requires a value")
 				return 1
 			}
+		case "--max-turns":
+			i++
+			if i < len(args) {
+				n, err := strconv.Atoi(args[i])
+				if err != nil || n < 1 {
+					fmt.Fprintf(os.Stderr, "sesh ralph: invalid --max-turns: %q\n", args[i])
+					return 1
+				}
+				maxTurns = n
+			} else {
+				fmt.Fprintln(os.Stderr, "sesh ralph: --max-turns requires a value")
+				return 1
+			}
+		case "--env":
+			i++
+			if i < len(args) {
+				envFile = args[i]
+			} else {
+				fmt.Fprintln(os.Stderr, "sesh ralph: --env requires a value")
+				return 1
+			}
 		default:
 			rest = append(rest, args[i])
 		}
 	}
 
 	if promptText == "" && len(rest) < 1 {
-		fmt.Fprintln(os.Stderr, "Usage: sesh ralph [--plan] [-p TEXT] [PROMPT.md] [max-iterations]")
-		fmt.Fprintln(os.Stderr, "  -p TEXT   Inline prompt text (alternative to file)")
-		fmt.Fprintln(os.Stderr, "  --plan    Adversarial plan refinement mode (default 5 iterations)")
+		fmt.Fprintln(os.Stderr, "Usage: sesh ralph [--plan] [--max-turns N] [--env FILE] [-p TEXT] [PROMPT.md] [max-iterations]")
+		fmt.Fprintln(os.Stderr, "  -p TEXT        Extra prompt text (appended after file, or standalone)")
+		fmt.Fprintln(os.Stderr, "  --plan         Adversarial plan refinement mode (default 5 iterations)")
+		fmt.Fprintln(os.Stderr, "  --max-turns N  Claude Code max turns per iteration (default 50)")
+		fmt.Fprintln(os.Stderr, "  --env FILE     Load env vars from file (KEY=VALUE format, # comments)")
 		fmt.Fprintln(os.Stderr, "  Stop: create .ralph-done or hit max iterations")
 		fmt.Fprintln(os.Stderr, "  State: ralph-state.md (read/written each iteration)")
 		return 1
 	}
 
 	promptFile := ""
-	if promptText == "" {
-		promptFile = rest[0]
-		rest = rest[1:]
+	if len(rest) >= 1 {
+		// Check if first positional arg looks like a file (not a number)
+		if _, err := strconv.Atoi(rest[0]); err != nil {
+			promptFile = rest[0]
+			rest = rest[1:]
+		}
 	}
 
 	maxIter := 20
@@ -126,6 +157,13 @@ func runRalph(args []string) int {
 		}
 	}
 
+	if envFile != "" {
+		if _, err := os.Stat(envFile); os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "sesh ralph: env file not found: %s\n", envFile)
+			return 1
+		}
+	}
+
 	initTelemetry()
 	ev := Event{Cmd: "ralph", OK: true}
 	if planMode {
@@ -137,7 +175,9 @@ func runRalph(args []string) int {
 		PromptFile: promptFile,
 		PromptText: promptText,
 		MaxIter:    maxIter,
+		MaxTurns:   maxTurns,
 		PlanMode:   planMode,
+		EnvFile:    envFile,
 		StateFile:  "ralph-state.md",
 		DoneFile:   ".ralph-done",
 		Stdout:     os.Stdout,
@@ -163,6 +203,9 @@ func Ralph(cfg RalphConfig, ev *Event) int {
 	if cfg.Stderr == nil {
 		cfg.Stderr = os.Stderr
 	}
+	if cfg.MaxTurns == 0 {
+		cfg.MaxTurns = 100
+	}
 
 	os.Remove(cfg.DoneFile)
 	loopStart := time.Now()
@@ -182,6 +225,24 @@ func Ralph(cfg RalphConfig, ev *Event) int {
 			label = label[:60] + "..."
 		}
 	}
+	// Load env file (explicit or auto-detect .env in cwd)
+	var extraEnv []string
+	envSource := cfg.EnvFile
+	if envSource == "" {
+		if _, err := os.Stat(".env"); err == nil {
+			envSource = ".env"
+		}
+	}
+	if envSource != "" {
+		var err error
+		extraEnv, err = parseEnvFile(envSource)
+		if err != nil {
+			fmt.Fprintf(cfg.Stderr, "ralph: warning: failed to parse %s: %v\n", envSource, err)
+		} else {
+			fmt.Fprintf(cfg.Stderr, "ralph: loaded %d env vars from %s\n", len(extraEnv), envSource)
+		}
+	}
+
 	fmt.Fprintf(cfg.Stderr, "ralph: prompt=%s max=%d mode=%s cwd=%s\n", label, cfg.MaxIter, mode, cwd)
 	fmt.Fprintf(cfg.Stderr, "ralph: started at %s\n\n", time.Now().Format("2006-01-02 15:04:05"))
 
@@ -202,7 +263,7 @@ func Ralph(cfg RalphConfig, ev *Event) int {
 		killStaleServers()
 
 		prompt := buildPrompt(i, cfg.MaxIter, cfg.StateFile, cfg.PromptFile, cfg.PromptText, stallCount, cfg.PlanMode)
-		result := RunIteration(ctx, prompt, cfg.Stdout)
+		result := RunIteration(ctx, prompt, cfg.MaxTurns, extraEnv, cfg.Stdout)
 
 		// stall detection: did git HEAD change?
 		head := gitHead()
@@ -252,17 +313,23 @@ func Ralph(cfg RalphConfig, ev *Event) int {
 }
 
 // RunIteration runs one claude session and formats output in-process.
-func RunIteration(ctx context.Context, prompt string, w io.Writer) IterResult {
+func RunIteration(ctx context.Context, prompt string, maxTurns int, extraEnv []string, w io.Writer) IterResult {
 	start := time.Now()
 
-	cmd := exec.CommandContext(ctx, "claude",
+	args := []string{
 		"-p", prompt,
-		"--max-turns", "50",
 		"--allowedTools", "*",
 		"--dangerously-skip-permissions",
 		"--verbose",
 		"--output-format", "stream-json",
-	)
+	}
+	if maxTurns > 0 {
+		args = append(args, "--max-turns", strconv.Itoa(maxTurns))
+	}
+	cmd := exec.CommandContext(ctx, "claude", args...)
+	if len(extraEnv) > 0 {
+		cmd.Env = append(os.Environ(), extraEnv...)
+	}
 	cmd.Stderr = os.Stderr
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error {
@@ -332,7 +399,7 @@ Do NOT re-audit. Do NOT start a server. Do NOT take screenshots.
 `, stallCount)
 	}
 
-	// user prompt
+	// user prompt (file + optional inline text)
 	if promptFile != "" {
 		content, err := os.ReadFile(promptFile)
 		if err != nil {
@@ -340,7 +407,11 @@ Do NOT re-audit. Do NOT start a server. Do NOT take screenshots.
 		} else {
 			b.Write(content)
 		}
-	} else {
+	}
+	if promptText != "" {
+		if promptFile != "" {
+			b.WriteString("\n\n---\n\n## Additional Instructions\n\n")
+		}
 		b.WriteString(promptText)
 	}
 
@@ -436,6 +507,37 @@ func printIterSummary(w io.Writer, iter int, result IterResult, totalDur time.Du
 func fmtDuration(d time.Duration) string {
 	s := int(d.Seconds())
 	return fmt.Sprintf("%dm%ds", s/60, s%60)
+}
+
+// parseEnvFile reads a .env file and returns KEY=VALUE pairs.
+// Supports # comments, blank lines, and optional quoting.
+func parseEnvFile(path string) ([]string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	var envs []string
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		k, v, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		k = strings.TrimSpace(k)
+		v = strings.TrimSpace(v)
+		// Strip surrounding quotes
+		if len(v) >= 2 && ((v[0] == '"' && v[len(v)-1] == '"') || (v[0] == '\'' && v[len(v)-1] == '\'')) {
+			v = v[1 : len(v)-1]
+		}
+		envs = append(envs, k+"="+v)
+	}
+	return envs, scanner.Err()
 }
 
 func lastLine(s string) string {
