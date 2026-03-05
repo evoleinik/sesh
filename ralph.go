@@ -213,10 +213,17 @@ func Ralph(cfg RalphConfig, ev *Event) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// After first Ctrl+C cancels ctx, restore default handler so second Ctrl+C hard-kills
+	// After first Ctrl+C: unregister NotifyContext, then hard-exit on next signal.
+	// Pattern from docker/kubectl — NotifyContext's internal channel eats signals
+	// even after signal.Reset, so we must stop() first and register a fresh handler.
 	go func() {
 		<-ctx.Done()
-		signal.Reset(os.Interrupt, syscall.SIGTERM)
+		stop() // unregister NotifyContext's signal routing
+		c := make(chan os.Signal, 1)
+		signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+		<-c
+		fmt.Fprintf(cfg.Stderr, "\nforce quit\n")
+		os.Exit(130)
 	}()
 
 	cwd, _ := os.Getwd()
