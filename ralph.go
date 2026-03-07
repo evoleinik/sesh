@@ -393,7 +393,7 @@ func Ralph(cfg RalphConfig, ev *Event) int {
 		steerJSON := ""
 		if steerScript != "" && len(turnOutput) > 0 {
 			var err error
-			steerJSON, err = runSteering(steerScript, turnOutput, cfg.StateFile)
+			steerJSON, err = runSteering(steerScript, turnOutput, cfg)
 			if err != nil {
 				fmt.Fprintf(cfg.Stderr, "ralph: steering failed: %v\n", err)
 			} else {
@@ -810,17 +810,29 @@ func resolveSteerScript(configured string) string {
 	return ""
 }
 
-// runSteering executes the steering script, feeding it the last turn's
-// output via stdin. The steerer observes what the worker actually did.
-func runSteering(script string, turnOutput []byte, stateFile string) (string, error) {
+// runSteering executes the steering script, feeding it the original task,
+// last turn's output, and state file via stdin.
+func runSteering(script string, turnOutput []byte, cfg RalphConfig) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "bash", script, "-")
 
 	var stdin bytes.Buffer
-	stdin.WriteString("## Agent Output (last turn)\n\n")
+
+	// Original task — so steerer knows WHAT the worker should be building
+	stdin.WriteString("## Original Task\n\n")
+	if cfg.PromptFile != "" {
+		if content, err := os.ReadFile(cfg.PromptFile); err == nil {
+			stdin.Write(content)
+		}
+	}
+	if cfg.PromptText != "" {
+		stdin.WriteString(cfg.PromptText)
+	}
+
+	stdin.WriteString("\n\n---\n\n## Agent Output (last turn)\n\n")
 	stdin.Write(turnOutput)
-	if state, err := os.ReadFile(stateFile); err == nil {
+	if state, err := os.ReadFile(cfg.StateFile); err == nil {
 		stdin.WriteString("\n\n---\n\n## State File (ralph-state.md)\n\n")
 		stdin.Write(state)
 	}
