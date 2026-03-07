@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	_ "embed"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -23,7 +24,7 @@ var defaultPreamble string
 //go:embed prompts/ralph-plan-preamble.md
 var defaultPlanPreamble string
 
-// IterResult captures what happened in a single claude iteration.
+// IterResult captures what happened in a single claude iteration (legacy mode).
 type IterResult struct {
 	ExitCode     int
 	Duration     time.Duration
@@ -37,8 +38,8 @@ type IterResult struct {
 type RalphConfig struct {
 	PromptFile  string
 	PromptText  string    // inline prompt via -p (used if PromptFile empty)
-	MaxIter     int
-	MaxTurns    int       // Claude Code --max-turns per iteration (default 100)
+	MaxIter     int       // max turns (persistent mode) or iterations (legacy)
+	MaxTurns    int       // Claude Code --max-turns per iteration (legacy only)
 	PlanMode    bool      // use adversarial planning preamble
 	EnvFile     string    // .env file to source before each iteration
 	SteerScript string    // path to steering script ("" = auto-detect, "none" = disabled)
@@ -206,7 +207,26 @@ func runRalph(args []string) int {
 	return code
 }
 
-// Ralph runs the iteration loop. Returns exit code.
+// sendUserMessage writes a stream-json user message to the claude stdin pipe.
+func sendUserMessage(w io.Writer, text string) error {
+	msg := map[string]interface{}{
+		"type": "user",
+		"message": map[string]interface{}{
+			"role":    "user",
+			"content": text,
+		},
+	}
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return err
+	}
+	_, err = fmt.Fprintf(w, "%s\n", data)
+	return err
+}
+
+// Ralph runs a persistent Claude session with steering between turns.
+// Single session, no restarts, no context loss. The steerer observes the
+// same output stream the user sees and injects guidance between turns.
 func Ralph(cfg RalphConfig, ev *Event) int {
 	if cfg.StateFile == "" {
 		cfg.StateFile = "ralph-state.md"
@@ -230,12 +250,9 @@ func Ralph(cfg RalphConfig, ev *Event) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// After first Ctrl+C: unregister NotifyContext, then hard-exit on next signal.
-	// Pattern from docker/kubectl — NotifyContext's internal channel eats signals
-	// even after signal.Reset, so we must stop() first and register a fresh handler.
 	go func() {
 		<-ctx.Done()
-		stop() // unregister NotifyContext's signal routing
+		stop()
 		c := make(chan os.Signal, 1)
 		signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 		<-c
@@ -255,7 +272,8 @@ func Ralph(cfg RalphConfig, ev *Event) int {
 			label = label[:60] + "..."
 		}
 	}
-	// Load env file (explicit or auto-detect .env in cwd)
+
+	// Load env file
 	var extraEnv []string
 	envSource := cfg.EnvFile
 	if envSource == "" {
@@ -273,237 +291,346 @@ func Ralph(cfg RalphConfig, ev *Event) int {
 		}
 	}
 
-	// Resolve steering script
+	// Resolve steering
 	steerScript := resolveSteerScript(cfg.SteerScript)
 	if steerScript != "" {
 		fmt.Fprintf(cfg.Stderr, "ralph: steering=%s\n", steerScript)
 	}
 
 	fmt.Fprintf(cfg.Stderr, "ralph: prompt=%s max=%d mode=%s cwd=%s\n", label, cfg.MaxIter, mode, cwd)
+	fmt.Fprintf(cfg.Stderr, "ralph: persistent session (stream-json)\n")
 	fmt.Fprintf(cfg.Stderr, "ralph: started at %s\n\n", time.Now().Format("2006-01-02 15:04:05"))
 
-	lastHead := gitHead()
-	stallCount := 0
-	var lastOutput []byte // captured output from previous iteration
+	// Build initial prompt
+	initialPrompt := buildInitialPrompt(cfg)
 
-	for i := 1; i <= cfg.MaxIter; i++ {
-		if ctx.Err() != nil {
-			fmt.Fprintf(cfg.Stderr, "\n=== interrupted ===\n")
-			if ev != nil {
-				ev.Iterations = i - 1
-			}
-			return 130
-		}
-
-		fmt.Fprintf(cfg.Stderr, "=== iteration %d/%d  [%s] ===\n", i, cfg.MaxIter, time.Now().Format("15:04:05"))
-
-		killStaleServers()
-
-		// Steering: observe what the worker actually did last iteration
-		steerOutput := ""
-		if steerScript != "" && i > 1 && len(lastOutput) > 0 {
-			var err error
-			steerOutput, err = runSteering(steerScript, lastOutput, cfg.StateFile)
-			if err != nil {
-				fmt.Fprintf(cfg.Stderr, "ralph: steering failed: %v\n", err)
-			} else {
-				fmt.Fprintf(cfg.Stderr, "ralph: steering: %s\n", steerOutput)
-			}
-		}
-
-		prompt := buildPrompt(i, cfg.MaxIter, cfg.StateFile, cfg.PromptFile, cfg.PromptText, stallCount, cfg.PlanMode, steerOutput)
-		result := RunIteration(ctx, prompt, cfg.MaxTurns, extraEnv, cfg.Stdout)
-		lastOutput = result.Output
-
-		// stall detection: did git HEAD change?
-		head := gitHead()
-		if head == lastHead {
-			stallCount++
-			if stallCount >= 3 {
-				fmt.Fprintf(cfg.Stderr, "ralph: WARNING — %d consecutive iterations with no commits\n", stallCount)
-			}
-		} else {
-			stallCount = 0
-			lastHead = head
-		}
-
-		printIterSummary(cfg.Stderr, i, result, time.Since(loopStart))
-
-		if result.Interrupted {
-			fmt.Fprintf(cfg.Stderr, "\n=== interrupted ===\n")
-			if ev != nil {
-				ev.Iterations = i
-			}
-			return 130
-		}
-
-		if result.DoneFile {
-			totalDur := time.Since(loopStart)
-			fmt.Fprintf(cfg.Stderr, "=== done at iteration %d (agent signaled completion) [%s] ===\n", i, time.Now().Format("15:04:05"))
-			fmt.Fprintf(cfg.Stderr, "=== total time: %s ===\n", fmtDuration(totalDur))
-			if ev != nil {
-				ev.Iterations = i
-				ev.RalphDone = true
-			}
-			return 0
-		}
-
-		if !result.StateWritten {
-			generateFallbackState(i, cfg.StateFile)
-		}
-	}
-
-	totalDur := time.Since(loopStart)
-	fmt.Fprintf(cfg.Stderr, "=== stopped at max iterations (%d) [%s] ===\n", cfg.MaxIter, time.Now().Format("15:04:05"))
-	fmt.Fprintf(cfg.Stderr, "=== total time: %s ===\n", fmtDuration(totalDur))
-	if ev != nil {
-		ev.Iterations = cfg.MaxIter
-	}
-	return 1
-}
-
-// RunIteration runs one claude session and formats output in-process.
-func RunIteration(ctx context.Context, prompt string, maxTurns int, extraEnv []string, w io.Writer) IterResult {
-	start := time.Now()
-
+	// Launch claude with bidirectional stream-json
 	args := []string{
-		"-p", prompt,
+		"--print", "--verbose",
+		"--input-format", "stream-json",
+		"--output-format", "stream-json",
 		"--allowedTools", "*",
 		"--dangerously-skip-permissions",
-		"--verbose",
-		"--output-format", "stream-json",
 	}
-	if maxTurns > 0 {
-		args = append(args, "--max-turns", strconv.Itoa(maxTurns))
+	if cfg.MaxTurns > 0 {
+		args = append(args, "--max-turns", strconv.Itoa(cfg.MaxTurns))
 	}
+
 	cmd := exec.CommandContext(ctx, "claude", args...)
 	if len(extraEnv) > 0 {
 		cmd.Env = append(os.Environ(), extraEnv...)
 	}
-	// Pipe stderr instead of giving claude the terminal fd directly.
-	// If claude gets a real tty, it sets raw mode and Ctrl+C becomes
-	// byte 0x03 instead of SIGINT — making the process unkillable.
+
+	stdinPipe, err := cmd.StdinPipe()
+	if err != nil {
+		fmt.Fprintf(cfg.Stderr, "ralph: failed to create stdin pipe: %v\n", err)
+		return 1
+	}
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		fmt.Fprintf(cfg.Stderr, "ralph: failed to create stdout pipe: %v\n", err)
+		return 1
+	}
 	stderrPipe, err := cmd.StderrPipe()
 	if err != nil {
-		return IterResult{ExitCode: 1, Duration: time.Since(start)}
+		fmt.Fprintf(cfg.Stderr, "ralph: failed to create stderr pipe: %v\n", err)
+		return 1
 	}
+
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error {
 		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 	}
 	cmd.WaitDelay = 3 * time.Second
 
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return IterResult{ExitCode: 1, Duration: time.Since(start)}
-	}
-
 	if err := cmd.Start(); err != nil {
-		return IterResult{ExitCode: 1, Duration: time.Since(start)}
+		fmt.Fprintf(cfg.Stderr, "ralph: failed to start claude: %v\n", err)
+		return 1
 	}
 
-	// Forward stderr in background
+	// Forward claude stderr
 	go func() {
-		io.Copy(os.Stderr, stderrPipe)
+		io.Copy(cfg.Stderr, stderrPipe)
 	}()
 
-	// FormatStream in goroutine so cmd.Wait() isn't blocked behind pipe reads
-	// Tee output to both the user's terminal and a buffer for steering
-	var outputBuf bytes.Buffer
-	tee := io.MultiWriter(w, &outputBuf)
-	doneFmt := make(chan struct{})
-	go func() {
-		FormatStream(stdout, tee)
-		close(doneFmt)
-	}()
+	// Send initial prompt
+	fmt.Fprintf(cfg.Stderr, "=== turn 1/%d  [%s] ===\n", cfg.MaxIter, time.Now().Format("15:04:05"))
+	if err := sendUserMessage(stdinPipe, initialPrompt); err != nil {
+		fmt.Fprintf(cfg.Stderr, "ralph: failed to send initial prompt: %v\n", err)
+		stdinPipe.Close()
+		cmd.Wait()
+		return 1
+	}
 
-	waitErr := cmd.Wait()
-	<-doneFmt
-	dur := time.Since(start)
+	// Event loop: read stream-json, format output, steer between turns
+	scanner := bufio.NewScanner(stdoutPipe)
+	scanner.Buffer(make([]byte, 0, 256*1024), 1024*1024)
 
-	result := IterResult{Duration: dur, Output: outputBuf.Bytes()}
+	turn := 1
+	turnStart := time.Now()
+	lastWasTool := false
+	var turnOutput bytes.Buffer // captured formatted text for steering
 
-	if waitErr != nil {
-		if exitErr, ok := waitErr.(*exec.ExitError); ok {
-			result.ExitCode = exitErr.ExitCode()
-		} else {
-			result.ExitCode = 1
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		if len(line) == 0 {
+			continue
 		}
-	}
 
-	if ctx.Err() != nil {
-		result.Interrupted = true
-	}
+		var raw map[string]json.RawMessage
+		if err := json.Unmarshal(line, &raw); err != nil {
+			continue
+		}
 
-	if _, err := os.Stat(".ralph-done"); err == nil {
-		result.DoneFile = true
-	}
-	if _, err := os.Stat("ralph-state.md"); err == nil {
-		result.StateWritten = true
-	}
+		evType := jsonString(raw, "type")
+		evSubtype := jsonString(raw, "subtype")
 
-	return result
-}
+		switch evType {
+		case "assistant":
+			// Format and display (same as FormatStream)
+			formatAssistantEvent(raw, cfg.Stdout, &turnOutput, &lastWasTool)
 
-func buildPrompt(iter, max int, stateFile, promptFile, promptText string, stallCount int, planMode bool, steerOutput string) string {
-	var b strings.Builder
+		case "result":
+			// Turn complete
+			turnDur := time.Since(turnStart)
+			printTurnSummary(cfg.Stderr, turn, turnDur, time.Since(loopStart))
 
-	// preamble (read from disk each iteration — editable without rebuild)
-	b.WriteString(readPreamble(iter, max, stateFile, planMode))
-	b.WriteString("\n")
+			// Check for .ralph-done
+			if _, err := os.Stat(cfg.DoneFile); err == nil {
+				totalDur := time.Since(loopStart)
+				fmt.Fprintf(cfg.Stderr, "=== done at turn %d (agent signaled completion) [%s] ===\n", turn, time.Now().Format("15:04:05"))
+				fmt.Fprintf(cfg.Stderr, "=== total time: %s ===\n", fmtDuration(totalDur))
+				stdinPipe.Close()
+				cmd.Wait()
+				if ev != nil {
+					ev.Iterations = turn
+					ev.RalphDone = true
+				}
+				return 0
+			}
 
-	// Steering signal (replaces stall warning when active)
-	if steerOutput != "" {
-		b.WriteString("### Steering Signal\n\n")
-		for _, field := range []string{"status", "action", "reason", "directive"} {
-			if val := jsonField(steerOutput, field); val != "" {
-				label := strings.ToUpper(field[:1]) + field[1:]
-				b.WriteString("**" + label + ":** " + val + "\n")
+			// Max turns reached?
+			if turn >= cfg.MaxIter {
+				totalDur := time.Since(loopStart)
+				fmt.Fprintf(cfg.Stderr, "=== stopped at max turns (%d) [%s] ===\n", cfg.MaxIter, time.Now().Format("15:04:05"))
+				fmt.Fprintf(cfg.Stderr, "=== total time: %s ===\n", fmtDuration(totalDur))
+				stdinPipe.Close()
+				cmd.Wait()
+				if ev != nil {
+					ev.Iterations = turn
+				}
+				return 1
+			}
+
+			// Run steering on captured output
+			steerJSON := ""
+			if steerScript != "" && turnOutput.Len() > 0 {
+				var err error
+				steerJSON, err = runSteering(steerScript, turnOutput.Bytes(), cfg.StateFile)
+				if err != nil {
+					fmt.Fprintf(cfg.Stderr, "ralph: steering failed: %v\n", err)
+				} else {
+					fmt.Fprintf(cfg.Stderr, "ralph: steering: %s\n", steerJSON)
+				}
+			}
+
+			// Next turn
+			turn++
+			turnStart = time.Now()
+			turnOutput.Reset()
+			lastWasTool = false
+
+			fmt.Fprintf(cfg.Stderr, "=== turn %d/%d  [%s] ===\n", turn, cfg.MaxIter, time.Now().Format("15:04:05"))
+
+			// Build and send steering message
+			nextMsg := buildSteeringMessage(turn, cfg.MaxIter, steerJSON)
+			if err := sendUserMessage(stdinPipe, nextMsg); err != nil {
+				fmt.Fprintf(cfg.Stderr, "ralph: failed to send turn %d message: %v\n", turn, err)
+				break
+			}
+
+		case "system":
+			// Log init event
+			if evSubtype == "init" {
+				sessionID := jsonString(raw, "session_id")
+				if sessionID != "" {
+					fmt.Fprintf(cfg.Stderr, "ralph: session=%s\n", sessionID)
+				}
 			}
 		}
-		b.WriteString("\nRaw: `" + steerOutput + "`\n\n---\n\n")
-	} else if stallCount >= 3 {
-		// Fallback stall warning when no steering is available
-		fmt.Fprintf(&b, `
-### ⚠ STALL DETECTED — %d consecutive iterations with zero commits
-
-Previous iterations explored the codebase but changed nothing. You MUST either:
-1. **Create .ralph-done** if all work is complete (including if remaining items are BLOCKED)
-2. **Make a concrete code change and commit it** — not audit, not explore, not review
-
-If the TODO is empty and BLOCKED items require user action, create .ralph-done NOW.
-Do NOT re-audit. Do NOT start a server. Do NOT take screenshots.
-
----
-
-`, stallCount)
 	}
 
-	// user prompt (file + optional inline text)
-	if promptFile != "" {
-		content, err := os.ReadFile(promptFile)
+	// Process exited
+	waitErr := cmd.Wait()
+	totalDur := time.Since(loopStart)
+
+	if ctx.Err() != nil {
+		fmt.Fprintf(cfg.Stderr, "\n=== interrupted ===\n")
+		if ev != nil {
+			ev.Iterations = turn
+		}
+		return 130
+	}
+
+	if waitErr != nil {
+		fmt.Fprintf(cfg.Stderr, "=== claude exited with error: %v [%s] ===\n", waitErr, fmtDuration(totalDur))
+		if ev != nil {
+			ev.Iterations = turn
+		}
+		return 1
+	}
+
+	// Check if done file was created in the final turn
+	if _, err := os.Stat(cfg.DoneFile); err == nil {
+		fmt.Fprintf(cfg.Stderr, "=== done at turn %d [%s] ===\n", turn, time.Now().Format("15:04:05"))
+		fmt.Fprintf(cfg.Stderr, "=== total time: %s ===\n", fmtDuration(totalDur))
+		if ev != nil {
+			ev.Iterations = turn
+			ev.RalphDone = true
+		}
+		return 0
+	}
+
+	fmt.Fprintf(cfg.Stderr, "=== session ended at turn %d [%s] ===\n", turn, fmtDuration(totalDur))
+	if ev != nil {
+		ev.Iterations = turn
+	}
+	return 1
+}
+
+// formatAssistantEvent processes an assistant event: formats text/tool_use to
+// the display writer and captures formatted text for the steering buffer.
+func formatAssistantEvent(raw map[string]json.RawMessage, display io.Writer, capture *bytes.Buffer, lastWasTool *bool) {
+	msgRaw, ok := raw["message"]
+	if !ok {
+		return
+	}
+
+	var msg struct {
+		Content []struct {
+			Type  string          `json:"type"`
+			Text  string          `json:"text"`
+			Name  string          `json:"name"`
+			Input json.RawMessage `json:"input"`
+		} `json:"content"`
+	}
+	if err := json.Unmarshal(msgRaw, &msg); err != nil {
+		return
+	}
+
+	for _, block := range msg.Content {
+		switch block.Type {
+		case "text":
+			if block.Text == "" {
+				continue
+			}
+			if *lastWasTool {
+				fmt.Fprint(display, "\n")
+				fmt.Fprint(capture, "\n")
+			}
+			fmt.Fprint(display, block.Text)
+			fmt.Fprint(capture, block.Text)
+			*lastWasTool = false
+
+		case "tool_use":
+			detail := extractToolDetail(block.Name, block.Input)
+			prefix := "\n"
+			if *lastWasTool {
+				prefix = ""
+			}
+			out := fmt.Sprintf("%s%s▶ %s", prefix, dim, block.Name)
+			if detail != "" {
+				out += "  " + detail
+			}
+			out += reset
+			fmt.Fprintln(display, out)
+			// Capture without ANSI codes for steering
+			plain := fmt.Sprintf("%s▶ %s", prefix, block.Name)
+			if detail != "" {
+				plain += "  " + detail
+			}
+			fmt.Fprintln(capture, plain)
+			*lastWasTool = true
+		}
+	}
+}
+
+// buildInitialPrompt assembles the first turn's prompt with preamble + user task.
+func buildInitialPrompt(cfg RalphConfig) string {
+	var b strings.Builder
+
+	b.WriteString(readPreamble(1, cfg.MaxIter, cfg.StateFile, cfg.PlanMode))
+	b.WriteString("\n")
+
+	if cfg.PromptFile != "" {
+		content, err := os.ReadFile(cfg.PromptFile)
 		if err != nil {
 			fmt.Fprintf(&b, "[ERROR: could not read prompt file: %s]\n", err)
 		} else {
 			b.Write(content)
 		}
 	}
-	if promptText != "" {
-		if promptFile != "" {
+	if cfg.PromptText != "" {
+		if cfg.PromptFile != "" {
 			b.WriteString("\n\n---\n\n## Additional Instructions\n\n")
 		}
-		b.WriteString(promptText)
+		b.WriteString(cfg.PromptText)
 	}
 
-	// state file appended last (recency bias)
-	if state, err := os.ReadFile(stateFile); err == nil {
+	// Append state file if it exists from a previous run
+	if state, err := os.ReadFile(cfg.StateFile); err == nil {
 		b.WriteString("\n\n---\n\n")
-		b.WriteString("## CURRENT STATE — READ THIS FIRST (from previous iterations)\n\n")
-		b.WriteString("**This is your memory. Act on this, not on re-auditing the codebase.**\n\n")
+		b.WriteString("## CURRENT STATE — READ THIS FIRST (from previous run)\n\n")
 		b.Write(state)
 	}
 
 	return b.String()
+}
+
+// buildSteeringMessage creates the follow-up message sent between turns.
+func buildSteeringMessage(turn, maxTurn int, steerJSON string) string {
+	var b strings.Builder
+
+	fmt.Fprintf(&b, "Turn %d of %d. ", turn, maxTurn)
+
+	if steerJSON != "" {
+		status := jsonField(steerJSON, "status")
+		action := jsonField(steerJSON, "action")
+		directive := jsonField(steerJSON, "directive")
+		reason := jsonField(steerJSON, "reason")
+
+		switch status {
+		case "done":
+			b.WriteString("Work appears complete. Verify build passes and git is clean, then create .ralph-done.")
+		case "wrong":
+			fmt.Fprintf(&b, "WARNING: %s. Action: %s. %s", reason, action, directive)
+		case "stalled":
+			fmt.Fprintf(&b, "You appear stalled: %s. %s", reason, directive)
+		default:
+			if directive != "" {
+				b.WriteString(directive)
+			} else {
+				b.WriteString("Continue working.")
+			}
+		}
+	} else {
+		b.WriteString("Continue working on the task.")
+	}
+
+	return b.String()
+}
+
+func printTurnSummary(w io.Writer, turn int, turnDur, totalDur time.Duration) {
+	fmt.Fprintln(w)
+	fmt.Fprintf(w, "--- turn %d summary ---\n", turn)
+	fmt.Fprintf(w, "  duration: %s  (total: %s)\n", fmtDuration(turnDur), fmtDuration(totalDur))
+
+	if out, err := exec.Command("git", "log", "--oneline", "-1").Output(); err == nil {
+		fmt.Fprintf(w, "  last commit: %s", string(out))
+	}
+
+	fmt.Fprintln(w, "---")
+	fmt.Fprintln(w)
 }
 
 // resolveSteerScript finds a steering script via convention or explicit path.
@@ -517,11 +644,9 @@ func resolveSteerScript(configured string) string {
 		}
 		return configured
 	}
-	// Convention: ./steer.sh in cwd first
 	if info, err := os.Stat("./steer.sh"); err == nil && !info.IsDir() {
 		return "./steer.sh"
 	}
-	// Fallback: ~/src/steering-agent/steer.sh
 	home, _ := os.UserHomeDir()
 	fallback := filepath.Join(home, "src", "steering-agent", "steer.sh")
 	if info, err := os.Stat(fallback); err == nil && !info.IsDir() {
@@ -530,18 +655,16 @@ func resolveSteerScript(configured string) string {
 	return ""
 }
 
-// runSteering executes the steering script, feeding it the last iteration's
-// output via stdin. The steerer observes what the worker actually did, not
-// what the worker claims in its state file.
-func runSteering(script string, iterOutput []byte, stateFile string) (string, error) {
+// runSteering executes the steering script, feeding it the last turn's
+// output via stdin. The steerer observes what the worker actually did.
+func runSteering(script string, turnOutput []byte, stateFile string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "bash", script, "-")
 
-	// Build stdin: iteration output + state file (if exists)
 	var stdin bytes.Buffer
-	stdin.WriteString("## Agent Output (last iteration)\n\n")
-	stdin.Write(iterOutput)
+	stdin.WriteString("## Agent Output (last turn)\n\n")
+	stdin.Write(turnOutput)
 	if state, err := os.ReadFile(stateFile); err == nil {
 		stdin.WriteString("\n\n---\n\n## State File (ralph-state.md)\n\n")
 		stdin.Write(state)
@@ -555,20 +678,19 @@ func runSteering(script string, iterOutput []byte, stateFile string) (string, er
 	return strings.TrimSpace(string(out)), nil
 }
 
-// jsonField extracts a string value from JSON without importing encoding/json.
-// Handles: "key":"value" — good enough for steer.sh's simple flat output.
-func jsonField(json, key string) string {
+// jsonField extracts a string value from simple flat JSON.
+func jsonField(j, key string) string {
 	needle := `"` + key + `":"`
-	i := strings.Index(json, needle)
+	i := strings.Index(j, needle)
 	if i < 0 {
 		return ""
 	}
 	start := i + len(needle)
-	end := strings.Index(json[start:], `"`)
+	end := strings.Index(j[start:], `"`)
 	if end < 0 {
 		return ""
 	}
-	return json[start : start+end]
+	return j[start : start+end]
 }
 
 func gitHead() string {
@@ -580,73 +702,8 @@ func gitHead() string {
 }
 
 func killStaleServers() {
-	// best-effort, ignore errors
 	exec.Command("pkill", "-f", "next dev").Run()
 	exec.Command("pkill", "-f", "vite.*--port").Run()
-}
-
-func generateFallbackState(iter int, stateFile string) {
-	var b strings.Builder
-	fmt.Fprintf(&b, "# Ralph State (auto-generated — iteration %d did not write state)\n\n", iter)
-
-	b.WriteString("## DONE\n")
-	out, err := exec.Command("git", "log", "--oneline", "HEAD~5..HEAD").Output()
-	if err == nil && len(out) > 0 {
-		for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-			fmt.Fprintf(&b, "- %s\n", line)
-		}
-	} else {
-		b.WriteString("- (no recent commits)\n")
-	}
-
-	b.WriteString("\n## TODO\n")
-	b.WriteString("- Check git log and git diff for what's unfinished\n")
-	b.WriteString("- If all work is complete, create .ralph-done immediately\n")
-
-	b.WriteString("\n## BLOCKED\n")
-	b.WriteString("- none known\n")
-
-	b.WriteString("\n## NOTES\n")
-	b.WriteString("- Previous iteration did not write state. Check git diff for uncommitted work.\n")
-	if out, err := exec.Command("git", "diff", "--stat", "HEAD").Output(); err == nil {
-		if last := lastLine(strings.TrimSpace(string(out))); last != "" {
-			fmt.Fprintf(&b, "- Uncommitted changes: %s\n", last)
-		}
-	}
-
-	b.WriteString("\n## LEARNINGS (append-only — NEVER delete or edit previous entries)\n")
-	fmt.Fprintf(&b, "- iter %d: agent failed to write state file — likely ran out of context on audit loop\n", iter)
-
-	os.WriteFile(stateFile, []byte(b.String()), 0644)
-}
-
-func printIterSummary(w io.Writer, iter int, result IterResult, totalDur time.Duration) {
-	fmt.Fprintln(w)
-	fmt.Fprintf(w, "--- iteration %d summary ---\n", iter)
-	fmt.Fprintf(w, "  duration: %s  (total: %s)\n", fmtDuration(result.Duration), fmtDuration(totalDur))
-
-	if out, err := exec.Command("git", "diff", "--stat", "HEAD").Output(); err == nil {
-		if last := lastLine(strings.TrimSpace(string(out))); last != "" {
-			fmt.Fprintf(w, "  unstaged: %s\n", last)
-		}
-	}
-	if out, err := exec.Command("git", "diff", "--cached", "--stat").Output(); err == nil {
-		if last := lastLine(strings.TrimSpace(string(out))); last != "" {
-			fmt.Fprintf(w, "  staged:   %s\n", last)
-		}
-	}
-	if out, err := exec.Command("git", "log", "--oneline", "-1").Output(); err == nil {
-		fmt.Fprintf(w, "  last commit: %s", string(out))
-	}
-
-	stateExists := "no"
-	if _, err := os.Stat("ralph-state.md"); err == nil {
-		stateExists = "yes"
-	}
-	fmt.Fprintf(w, "  state file:  %s\n", stateExists)
-
-	fmt.Fprintln(w, "---")
-	fmt.Fprintln(w)
 }
 
 func fmtDuration(d time.Duration) string {
@@ -655,7 +712,6 @@ func fmtDuration(d time.Duration) string {
 }
 
 // parseEnvFile reads a .env file and returns KEY=VALUE pairs.
-// Supports # comments, blank lines, and optional quoting.
 func parseEnvFile(path string) ([]string, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -676,7 +732,6 @@ func parseEnvFile(path string) ([]string, error) {
 		}
 		k = strings.TrimSpace(k)
 		v = strings.TrimSpace(v)
-		// Strip surrounding quotes
 		if len(v) >= 2 && ((v[0] == '"' && v[len(v)-1] == '"') || (v[0] == '\'' && v[len(v)-1] == '\'')) {
 			v = v[1 : len(v)-1]
 		}

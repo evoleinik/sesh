@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -8,7 +10,7 @@ import (
 	"time"
 )
 
-func TestBuildPrompt(t *testing.T) {
+func TestBuildInitialPrompt(t *testing.T) {
 	dir := t.TempDir()
 	promptFile := filepath.Join(dir, "prompt.md")
 	stateFile := filepath.Join(dir, "ralph-state.md")
@@ -16,149 +18,204 @@ func TestBuildPrompt(t *testing.T) {
 	os.WriteFile(promptFile, []byte("Do the thing.\n"), 0644)
 	os.WriteFile(stateFile, []byte("# Ralph State\n\n## DONE\n- step 1\n"), 0644)
 
-	got := buildPrompt(3, 10, stateFile, promptFile, "", 0, false, "")
+	cfg := RalphConfig{
+		PromptFile: promptFile,
+		StateFile:  stateFile,
+		MaxIter:    10,
+	}
+	got := buildInitialPrompt(cfg)
 
-	if !strings.Contains(got, "iteration 3 of 10") {
-		t.Error("prompt should contain iteration number")
-	}
 	if !strings.Contains(got, "Do the thing.") {
-		t.Error("prompt should contain user prompt")
-	}
-	stateHeader := "## CURRENT STATE — READ THIS FIRST"
-	if !strings.Contains(got, stateHeader) {
-		t.Error("prompt should contain state header")
+		t.Error("should contain user prompt")
 	}
 	if !strings.Contains(got, "step 1") {
-		t.Error("prompt should contain state content")
-	}
-	// State should come after the user prompt (recency bias)
-	promptIdx := strings.Index(got, "Do the thing.")
-	stateIdx := strings.Index(got, stateHeader)
-	if stateIdx < promptIdx {
-		t.Error("state should come after user prompt for recency bias")
+		t.Error("should contain state content")
 	}
 }
 
-func TestBuildPromptNoState(t *testing.T) {
+func TestBuildInitialPromptNoState(t *testing.T) {
 	dir := t.TempDir()
 	promptFile := filepath.Join(dir, "prompt.md")
-	stateFile := filepath.Join(dir, "ralph-state.md") // does not exist
-
 	os.WriteFile(promptFile, []byte("Do the thing.\n"), 0644)
 
-	got := buildPrompt(1, 5, stateFile, promptFile, "", 0, false, "")
-
-	if strings.Contains(got, "## CURRENT STATE — READ THIS FIRST") {
-		t.Error("prompt should NOT contain state section when file absent")
+	cfg := RalphConfig{
+		PromptFile: promptFile,
+		StateFile:  filepath.Join(dir, "nonexistent.md"),
+		MaxIter:    5,
 	}
+	got := buildInitialPrompt(cfg)
+
 	if !strings.Contains(got, "Do the thing.") {
-		t.Error("prompt should still contain user prompt")
+		t.Error("should contain user prompt")
+	}
+	if strings.Contains(got, "CURRENT STATE — READ THIS FIRST") {
+		t.Error("should NOT contain state section when file absent")
 	}
 }
 
-func TestBuildPromptStallWarning(t *testing.T) {
+func TestBuildInitialPromptInline(t *testing.T) {
 	dir := t.TempDir()
-	promptFile := filepath.Join(dir, "prompt.md")
-	os.WriteFile(promptFile, []byte("Do the thing.\n"), 0644)
-
-	// No stall warning at stallCount < 3
-	got := buildPrompt(5, 10, filepath.Join(dir, "state.md"), promptFile, "", 2, false, "")
-	if strings.Contains(got, "STALL DETECTED") {
-		t.Error("should NOT show stall warning at stallCount=2")
+	cfg := RalphConfig{
+		PromptText: "Build a REST API",
+		StateFile:  filepath.Join(dir, "state.md"),
+		MaxIter:    3,
 	}
+	got := buildInitialPrompt(cfg)
 
-	// Stall warning at stallCount >= 3
-	got = buildPrompt(5, 10, filepath.Join(dir, "state.md"), promptFile, "", 3, false, "")
-	if !strings.Contains(got, "STALL DETECTED") {
-		t.Error("should show stall warning at stallCount=3")
-	}
-	if !strings.Contains(got, "3 consecutive iterations") {
-		t.Error("stall warning should mention count")
+	if !strings.Contains(got, "Build a REST API") {
+		t.Error("should contain inline text")
 	}
 }
 
-func TestBuildPromptSteering(t *testing.T) {
-	dir := t.TempDir()
-	promptFile := filepath.Join(dir, "prompt.md")
-	os.WriteFile(promptFile, []byte("Do the thing.\n"), 0644)
+func TestBuildSteeringMessage(t *testing.T) {
+	// Progressing
+	steerJSON := `{"status":"progressing","action":"continue","reason":"good progress","directive":"keep going"}`
+	got := buildSteeringMessage(3, 10, steerJSON)
+	if !strings.Contains(got, "Turn 3 of 10") {
+		t.Error("should contain turn number")
+	}
+	if !strings.Contains(got, "keep going") {
+		t.Error("should contain directive for progressing status")
+	}
 
-	steerJSON := `{"status":"stalled","action":"redirect","reason":"3 iterations no progress","directive":"scope down"}`
+	// Stalled
+	steerJSON = `{"status":"stalled","action":"redirect","reason":"no commits in 3 turns","directive":"scope down and commit something"}`
+	got = buildSteeringMessage(5, 10, steerJSON)
+	if !strings.Contains(got, "stalled") {
+		t.Error("should mention stalled")
+	}
+	if !strings.Contains(got, "scope down") {
+		t.Error("should contain directive")
+	}
 
-	// With steering, should include steering section
-	got := buildPrompt(3, 10, filepath.Join(dir, "state.md"), promptFile, "", 5, false, steerJSON)
-	if !strings.Contains(got, "### Steering Signal") {
-		t.Error("should contain steering signal header")
+	// Wrong
+	steerJSON = `{"status":"wrong","action":"deepen","reason":"thrashing with reverts","directive":"stop and diagnose"}`
+	got = buildSteeringMessage(4, 10, steerJSON)
+	if !strings.Contains(got, "WARNING") {
+		t.Error("should contain WARNING for wrong status")
 	}
-	if !strings.Contains(got, "**Status:** stalled") {
-		t.Error("should contain parsed status")
-	}
-	if !strings.Contains(got, "**Directive:** scope down") {
-		t.Error("should contain parsed directive")
-	}
-	// Should NOT contain stall warning when steering is active (even with stallCount=5)
-	if strings.Contains(got, "STALL DETECTED") {
-		t.Error("should NOT show stall warning when steering is active")
-	}
-}
 
-func TestBuildPromptPlanMode(t *testing.T) {
-	dir := t.TempDir()
-	promptFile := filepath.Join(dir, "plan.md")
-	os.WriteFile(promptFile, []byte("# My Plan\n\nDo X then Y.\n"), 0644)
+	// Done
+	steerJSON = `{"status":"done","action":"complete","reason":"all tasks done","directive":"create .ralph-done"}`
+	got = buildSteeringMessage(8, 10, steerJSON)
+	if !strings.Contains(got, "complete") {
+		t.Error("should mention completion")
+	}
 
-	got := buildPrompt(2, 5, filepath.Join(dir, "state.md"), promptFile, "", 0, true, "")
-
-	// Should use plan preamble, not execution preamble
-	if !strings.Contains(got, "Planning Loop") {
-		t.Error("plan mode should use planning preamble")
-	}
-	if strings.Contains(got, "Ralph Loop Context") {
-		t.Error("plan mode should NOT use execution preamble")
-	}
-	if !strings.Contains(got, "Iteration 2 of 5") {
-		t.Error("plan preamble should contain iteration number")
-	}
-	if !strings.Contains(got, "Do X then Y") {
-		t.Error("plan prompt should contain user content")
+	// No steering
+	got = buildSteeringMessage(2, 10, "")
+	if !strings.Contains(got, "Continue working") {
+		t.Error("should have generic continue message without steering")
 	}
 }
 
-func TestGenerateFallbackState(t *testing.T) {
-	dir := t.TempDir()
-	stateFile := filepath.Join(dir, "ralph-state.md")
-
-	generateFallbackState(3, stateFile)
-
-	data, err := os.ReadFile(stateFile)
+func TestSendUserMessage(t *testing.T) {
+	var buf bytes.Buffer
+	err := sendUserMessage(&buf, "hello world")
 	if err != nil {
-		t.Fatalf("fallback state not written: %v", err)
+		t.Fatalf("sendUserMessage failed: %v", err)
 	}
-	content := string(data)
 
-	for _, section := range []string{"## DONE", "## TODO", "## BLOCKED", "## NOTES", "## LEARNINGS"} {
-		if !strings.Contains(content, section) {
-			t.Errorf("fallback state missing section: %s", section)
+	var msg map[string]interface{}
+	if err := json.Unmarshal(buf.Bytes(), &msg); err != nil {
+		t.Fatalf("output not valid JSON: %v", err)
+	}
+
+	if msg["type"] != "user" {
+		t.Errorf("type = %v, want user", msg["type"])
+	}
+	inner := msg["message"].(map[string]interface{})
+	if inner["role"] != "user" {
+		t.Errorf("role = %v, want user", inner["role"])
+	}
+	if inner["content"] != "hello world" {
+		t.Errorf("content = %v, want hello world", inner["content"])
+	}
+}
+
+func TestFormatAssistantEvent(t *testing.T) {
+	// Text block
+	event := `{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Hello from Claude"}]}}`
+	var raw map[string]json.RawMessage
+	json.Unmarshal([]byte(event), &raw)
+
+	var display, capture bytes.Buffer
+	lastWasTool := false
+	formatAssistantEvent(raw, &display, &capture, &lastWasTool)
+
+	if !strings.Contains(display.String(), "Hello from Claude") {
+		t.Error("display should contain text")
+	}
+	if !strings.Contains(capture.String(), "Hello from Claude") {
+		t.Error("capture should contain text")
+	}
+
+	// Tool use block
+	display.Reset()
+	capture.Reset()
+	lastWasTool = false
+	event = `{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Bash","input":{"command":"ls -la"}}]}}`
+	json.Unmarshal([]byte(event), &raw)
+	formatAssistantEvent(raw, &display, &capture, &lastWasTool)
+
+	if !strings.Contains(display.String(), "▶ Bash") {
+		t.Error("display should contain tool indicator")
+	}
+	if !strings.Contains(capture.String(), "▶ Bash") {
+		t.Error("capture should contain tool indicator")
+	}
+	if !strings.Contains(capture.String(), "ls -la") {
+		t.Error("capture should contain command")
+	}
+}
+
+func TestJsonField(t *testing.T) {
+	j := `{"status":"progressing","action":"continue","reason":"work going well","directive":"keep at it"}`
+	tests := []struct {
+		key, want string
+	}{
+		{"status", "progressing"},
+		{"action", "continue"},
+		{"reason", "work going well"},
+		{"directive", "keep at it"},
+		{"missing", ""},
+	}
+	for _, tt := range tests {
+		got := jsonField(j, tt.key)
+		if got != tt.want {
+			t.Errorf("jsonField(%q) = %q, want %q", tt.key, got, tt.want)
 		}
 	}
-	if !strings.Contains(content, "iteration 3") {
-		t.Error("fallback state should mention iteration number")
+}
+
+func TestResolveSteerScript(t *testing.T) {
+	if got := resolveSteerScript("none"); got != "" {
+		t.Errorf("none should return empty, got %q", got)
+	}
+
+	if got := resolveSteerScript("/nonexistent/steer.sh"); got != "" {
+		t.Errorf("missing explicit should return empty, got %q", got)
+	}
+
+	dir := t.TempDir()
+	script := filepath.Join(dir, "steer.sh")
+	os.WriteFile(script, []byte("#!/bin/bash\n"), 0755)
+	if got := resolveSteerScript(script); got != script {
+		t.Errorf("explicit should return path, got %q", got)
 	}
 }
 
 func TestRunRalphBadArgs(t *testing.T) {
-	// No args
 	code := runRalph(nil)
 	if code != 1 {
 		t.Errorf("no args: got exit %d, want 1", code)
 	}
 
-	// Nonexistent file
 	code = runRalph([]string{"/tmp/nonexistent-ralph-test-prompt.md"})
 	if code != 1 {
 		t.Errorf("missing file: got exit %d, want 1", code)
 	}
 
-	// Bad max-iterations
 	dir := t.TempDir()
 	f := filepath.Join(dir, "p.md")
 	os.WriteFile(f, []byte("test"), 0644)
@@ -173,63 +230,9 @@ func TestRunRalphBadArgs(t *testing.T) {
 		t.Errorf("zero max: got exit %d, want 1", code)
 	}
 
-	// -p without value
 	code = runRalph([]string{"-p"})
 	if code != 1 {
 		t.Errorf("-p without value: got exit %d, want 1", code)
-	}
-}
-
-func TestBuildPromptInline(t *testing.T) {
-	dir := t.TempDir()
-	stateFile := filepath.Join(dir, "ralph-state.md")
-
-	got := buildPrompt(1, 3, stateFile, "", "Build a REST API", 0, false, "")
-
-	if !strings.Contains(got, "Build a REST API") {
-		t.Error("prompt should contain inline text")
-	}
-	if !strings.Contains(got, "iteration 1 of 3") {
-		t.Error("prompt should contain iteration number")
-	}
-}
-
-func TestJsonField(t *testing.T) {
-	json := `{"status":"progressing","action":"continue","reason":"work going well","directive":"keep at it"}`
-	tests := []struct {
-		key, want string
-	}{
-		{"status", "progressing"},
-		{"action", "continue"},
-		{"reason", "work going well"},
-		{"directive", "keep at it"},
-		{"missing", ""},
-	}
-	for _, tt := range tests {
-		got := jsonField(json, tt.key)
-		if got != tt.want {
-			t.Errorf("jsonField(%q) = %q, want %q", tt.key, got, tt.want)
-		}
-	}
-}
-
-func TestResolveSteerScript(t *testing.T) {
-	// "none" disables
-	if got := resolveSteerScript("none"); got != "" {
-		t.Errorf("none should return empty, got %q", got)
-	}
-
-	// nonexistent explicit path returns empty
-	if got := resolveSteerScript("/nonexistent/steer.sh"); got != "" {
-		t.Errorf("missing explicit should return empty, got %q", got)
-	}
-
-	// existing explicit path returns it
-	dir := t.TempDir()
-	script := filepath.Join(dir, "steer.sh")
-	os.WriteFile(script, []byte("#!/bin/bash\n"), 0755)
-	if got := resolveSteerScript(script); got != script {
-		t.Errorf("explicit should return path, got %q", got)
 	}
 }
 
