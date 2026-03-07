@@ -24,28 +24,18 @@ var defaultPreamble string
 //go:embed prompts/ralph-plan-preamble.md
 var defaultPlanPreamble string
 
-// IterResult captures what happened in a single claude iteration (legacy mode).
-type IterResult struct {
-	ExitCode     int
-	Duration     time.Duration
-	Interrupted  bool   // context was cancelled
-	DoneFile     bool   // .ralph-done exists after iteration
-	StateWritten bool   // ralph-state.md exists after iteration
-	Output       []byte // captured formatted output from this iteration
-}
-
 // RalphConfig controls the ralph loop.
 type RalphConfig struct {
 	PromptFile  string
 	PromptText  string    // inline prompt via -p (used if PromptFile empty)
-	MaxIter     int       // max turns (persistent mode) or iterations (legacy)
-	MaxTurns    int       // Claude Code --max-turns per iteration (legacy only)
+	MaxIter     int       // max steering turns
+	MaxTurns    int       // Claude Code --max-turns (tool call budget)
 	PlanMode    bool      // use adversarial planning preamble
 	EnvFile     string    // .env file to source before each iteration
 	SteerScript string    // path to steering script ("" = auto-detect, "none" = disabled)
 	StateFile   string
 	DoneFile    string
-	Stdout      io.Writer // FormatStream output (default: os.Stdout)
+	Stdout      io.Writer // status output (default: os.Stdout)
 	Stderr      io.Writer // ralph metadata output (default: os.Stderr)
 }
 
@@ -135,7 +125,7 @@ func runRalph(args []string) int {
 		fmt.Fprintln(os.Stderr, "Usage: sesh ralph [--plan] [--max-turns N] [--env FILE] [--steer PATH] [--no-steer] [-p TEXT] [PROMPT.md] [max-iterations]")
 		fmt.Fprintln(os.Stderr, "  -p TEXT        Extra prompt text (appended after file, or standalone)")
 		fmt.Fprintln(os.Stderr, "  --plan         Adversarial plan refinement mode (default 5 iterations)")
-		fmt.Fprintln(os.Stderr, "  --max-turns N  Claude Code max turns per iteration (default 50)")
+		fmt.Fprintln(os.Stderr, "  --max-turns N  Claude Code max turns per iteration (default 100)")
 		fmt.Fprintln(os.Stderr, "  --env FILE     Load env vars from file (KEY=VALUE format, # comments)")
 		fmt.Fprintln(os.Stderr, "  --steer PATH   Use specific steering script (default: auto-detect)")
 		fmt.Fprintln(os.Stderr, "  --no-steer     Disable steering")
@@ -207,26 +197,10 @@ func runRalph(args []string) int {
 	return code
 }
 
-// sendUserMessage writes a stream-json user message to the claude stdin pipe.
-func sendUserMessage(w io.Writer, text string) error {
-	msg := map[string]interface{}{
-		"type": "user",
-		"message": map[string]interface{}{
-			"role":    "user",
-			"content": text,
-		},
-	}
-	data, err := json.Marshal(msg)
-	if err != nil {
-		return err
-	}
-	_, err = fmt.Fprintf(w, "%s\n", data)
-	return err
-}
-
-// Ralph runs a persistent Claude session with steering between turns.
-// Single session, no restarts, no context loss. The steerer observes the
-// same output stream the user sees and injects guidance between turns.
+// Ralph runs Claude in a tmux session with LLM-based steering between turns.
+// The user can attach to the tmux session to watch Claude work in the native TUI.
+// A background watcher monitors the session JSONL for turn completion and
+// sends steering messages as follow-up prompts.
 func Ralph(cfg RalphConfig, ev *Event) int {
 	if cfg.StateFile == "" {
 		cfg.StateFile = "ralph-state.md"
@@ -259,6 +233,12 @@ func Ralph(cfg RalphConfig, ev *Event) int {
 		fmt.Fprintf(cfg.Stderr, "\nforce quit\n")
 		os.Exit(130)
 	}()
+
+	// Check tmux
+	if _, err := exec.LookPath("tmux"); err != nil {
+		fmt.Fprintln(cfg.Stderr, "ralph: tmux is required")
+		return 1
+	}
 
 	cwd, _ := os.Getwd()
 	mode := "execute"
@@ -297,82 +277,353 @@ func Ralph(cfg RalphConfig, ev *Event) int {
 		fmt.Fprintf(cfg.Stderr, "ralph: steering=%s\n", steerScript)
 	}
 
-	fmt.Fprintf(cfg.Stderr, "ralph: prompt=%s max=%d mode=%s cwd=%s\n", label, cfg.MaxIter, mode, cwd)
-	fmt.Fprintf(cfg.Stderr, "ralph: persistent session (stream-json)\n")
-	fmt.Fprintf(cfg.Stderr, "ralph: started at %s\n\n", time.Now().Format("2006-01-02 15:04:05"))
+	// Create tmux session
+	sessionName := fmt.Sprintf("ralph-%d", time.Now().UnixMilli()%100000)
 
-	// Build initial prompt
-	initialPrompt := buildInitialPrompt(cfg)
-
-	// Launch claude with bidirectional stream-json
-	args := []string{
-		"--print", "--verbose",
-		"--input-format", "stream-json",
-		"--output-format", "stream-json",
-		"--allowedTools", "*",
-		"--dangerously-skip-permissions",
-	}
+	// Build claude command
+	claudeArgs := []string{"--dangerously-skip-permissions"}
 	if cfg.MaxTurns > 0 {
-		args = append(args, "--max-turns", strconv.Itoa(cfg.MaxTurns))
+		claudeArgs = append(claudeArgs, "--max-turns", strconv.Itoa(cfg.MaxTurns))
 	}
 
-	cmd := exec.CommandContext(ctx, "claude", args...)
+	// Build shell command for tmux (unset CLAUDECODE to allow nested sessions)
+	var envPrefix string
 	if len(extraEnv) > 0 {
-		cmd.Env = append(os.Environ(), extraEnv...)
+		// Export env vars in the shell command
+		var exports []string
+		for _, kv := range extraEnv {
+			exports = append(exports, fmt.Sprintf("export %s", shellQuote(kv)))
+		}
+		envPrefix = strings.Join(exports, "; ") + "; "
 	}
+	claudeCmd := fmt.Sprintf("env -u CLAUDECODE claude %s", strings.Join(claudeArgs, " "))
+	shellCmd := fmt.Sprintf("%s%s", envPrefix, claudeCmd)
 
-	stdinPipe, err := cmd.StdinPipe()
-	if err != nil {
-		fmt.Fprintf(cfg.Stderr, "ralph: failed to create stdin pipe: %v\n", err)
+	fmt.Fprintf(cfg.Stderr, "ralph: prompt=%s max=%d mode=%s cwd=%s\n", label, cfg.MaxIter, mode, cwd)
+	fmt.Fprintf(cfg.Stderr, "ralph: tmux session (native Claude TUI)\n")
+	fmt.Fprintf(cfg.Stderr, "ralph: started at %s\n", time.Now().Format("2006-01-02 15:04:05"))
+
+	if err := exec.Command("tmux", "new-session", "-d",
+		"-s", sessionName,
+		"-x", "200", "-y", "50",
+		shellCmd,
+	).Run(); err != nil {
+		fmt.Fprintf(cfg.Stderr, "ralph: failed to create tmux session: %v\n", err)
 		return 1
 	}
-	stdoutPipe, err := cmd.StdoutPipe()
-	if err != nil {
-		fmt.Fprintf(cfg.Stderr, "ralph: failed to create stdout pipe: %v\n", err)
-		return 1
-	}
-	stderrPipe, err := cmd.StderrPipe()
-	if err != nil {
-		fmt.Fprintf(cfg.Stderr, "ralph: failed to create stderr pipe: %v\n", err)
-		return 1
-	}
-
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Cancel = func() error {
-		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-	}
-	cmd.WaitDelay = 3 * time.Second
-
-	if err := cmd.Start(); err != nil {
-		fmt.Fprintf(cfg.Stderr, "ralph: failed to start claude: %v\n", err)
-		return 1
-	}
-
-	// Forward claude stderr
-	go func() {
-		io.Copy(cfg.Stderr, stderrPipe)
+	defer func() {
+		exec.Command("tmux", "kill-session", "-t", sessionName).Run()
 	}()
 
-	// Send initial prompt
-	fmt.Fprintf(cfg.Stderr, "=== turn 1/%d  [%s] ===\n", cfg.MaxIter, time.Now().Format("15:04:05"))
-	if err := sendUserMessage(stdinPipe, initialPrompt); err != nil {
-		fmt.Fprintf(cfg.Stderr, "ralph: failed to send initial prompt: %v\n", err)
-		stdinPipe.Close()
-		cmd.Wait()
+	fmt.Fprintf(cfg.Stderr, "ralph: session=%s\n", sessionName)
+	fmt.Fprintf(cfg.Stderr, "ralph: watch with: tmux attach -t %s\n\n", sessionName)
+
+	// Wait for Claude to be ready
+	if !waitForClaudeReady(ctx, sessionName) {
+		fmt.Fprintln(cfg.Stderr, "ralph: claude failed to start")
 		return 1
 	}
 
-	// Event loop: read stream-json, format output, steer between turns
-	scanner := bufio.NewScanner(stdoutPipe)
-	scanner.Buffer(make([]byte, 0, 256*1024), 1024*1024)
+	// Send initial prompt
+	initialPrompt := buildInitialPrompt(cfg)
+	fmt.Fprintf(cfg.Stderr, "=== turn 1/%d  [%s] ===\n", cfg.MaxIter, time.Now().Format("15:04:05"))
+	if err := tmuxSendText(sessionName, initialPrompt); err != nil {
+		fmt.Fprintf(cfg.Stderr, "ralph: failed to send initial prompt: %v\n", err)
+		return 1
+	}
 
+	// Find the session JSONL file
+	jsonlDir := projectJSONLDir(cwd)
+	jsonlPath := ""
+	if jsonlDir != "" {
+		var err error
+		jsonlPath, err = waitForNewJSONL(ctx, jsonlDir, loopStart)
+		if err != nil {
+			fmt.Fprintf(cfg.Stderr, "ralph: warning: could not find session JSONL: %v\n", err)
+		} else {
+			fmt.Fprintf(cfg.Stderr, "ralph: watching %s\n", filepath.Base(jsonlPath))
+		}
+	}
+
+	// Main turn loop
 	turn := 1
 	turnStart := time.Now()
-	lastWasTool := false
-	var turnOutput bytes.Buffer // captured formatted text for steering
 
-	for scanner.Scan() {
-		line := scanner.Bytes()
+	for turn <= cfg.MaxIter {
+		// Wait for turn to complete
+		turnOutput := waitForTurnComplete(ctx, sessionName, jsonlPath)
+
+		turnDur := time.Since(turnStart)
+		printTurnSummary(cfg.Stderr, turn, turnDur, time.Since(loopStart))
+
+		// Check .ralph-done
+		if _, err := os.Stat(cfg.DoneFile); err == nil {
+			totalDur := time.Since(loopStart)
+			fmt.Fprintf(cfg.Stderr, "=== done at turn %d (agent signaled completion) [%s] ===\n", turn, time.Now().Format("15:04:05"))
+			fmt.Fprintf(cfg.Stderr, "=== total time: %s ===\n", fmtDuration(totalDur))
+			if ev != nil {
+				ev.Iterations = turn
+				ev.RalphDone = true
+			}
+			return 0
+		}
+
+		// Max turns?
+		if turn >= cfg.MaxIter {
+			totalDur := time.Since(loopStart)
+			fmt.Fprintf(cfg.Stderr, "=== stopped at max turns (%d) [%s] ===\n", cfg.MaxIter, time.Now().Format("15:04:05"))
+			fmt.Fprintf(cfg.Stderr, "=== total time: %s ===\n", fmtDuration(totalDur))
+			if ev != nil {
+				ev.Iterations = turn
+			}
+			return 0
+		}
+
+		// Check if tmux session still exists (Claude exited)
+		if !tmuxSessionExists(sessionName) {
+			totalDur := time.Since(loopStart)
+			fmt.Fprintf(cfg.Stderr, "=== claude exited at turn %d [%s] ===\n", turn, fmtDuration(totalDur))
+			if ev != nil {
+				ev.Iterations = turn
+			}
+			return 1
+		}
+
+		// Run steering on captured output
+		steerJSON := ""
+		if steerScript != "" && len(turnOutput) > 0 {
+			var err error
+			steerJSON, err = runSteering(steerScript, turnOutput, cfg.StateFile)
+			if err != nil {
+				fmt.Fprintf(cfg.Stderr, "ralph: steering failed: %v\n", err)
+			} else {
+				fmt.Fprintf(cfg.Stderr, "ralph: steering: %s\n", steerJSON)
+			}
+		}
+
+		// Next turn
+		turn++
+		turnStart = time.Now()
+
+		fmt.Fprintf(cfg.Stderr, "=== turn %d/%d  [%s] ===\n", turn, cfg.MaxIter, time.Now().Format("15:04:05"))
+
+		// Build and send steering message
+		nextMsg := buildSteeringMessage(turn, cfg.MaxIter, steerJSON)
+		if err := tmuxSendText(sessionName, nextMsg); err != nil {
+			fmt.Fprintf(cfg.Stderr, "ralph: failed to send turn %d message: %v\n", turn, err)
+			break
+		}
+	}
+
+	// Process exited or context cancelled
+	totalDur := time.Since(loopStart)
+	if ctx.Err() != nil {
+		fmt.Fprintf(cfg.Stderr, "\n=== interrupted ===\n")
+		if ev != nil {
+			ev.Iterations = turn
+		}
+		return 130
+	}
+
+	fmt.Fprintf(cfg.Stderr, "=== session ended at turn %d [%s] ===\n", turn, fmtDuration(totalDur))
+	if ev != nil {
+		ev.Iterations = turn
+	}
+	return 1
+}
+
+// tmuxSendText sends text to a tmux session via send-keys (literal mode).
+// For very long text (>4K), falls back to writing a temp file and using
+// the shell to cat it into the prompt.
+func tmuxSendText(session, text string) error {
+	if len(text) > 4000 {
+		return tmuxSendLongText(session, text)
+	}
+
+	// send-keys -l sends literal text (no key interpretation)
+	if err := exec.Command("tmux", "send-keys", "-t", session, "-l", text).Run(); err != nil {
+		return fmt.Errorf("send-keys: %w", err)
+	}
+
+	// Small delay to let TUI process
+	time.Sleep(100 * time.Millisecond)
+
+	// Press Enter to submit
+	return exec.Command("tmux", "send-keys", "-t", session, "Enter").Run()
+}
+
+// tmuxSendLongText handles prompts >4K by writing to a temp file and using
+// shell read + paste in the tmux session.
+func tmuxSendLongText(session, text string) error {
+	tmp, err := os.CreateTemp("", "ralph-msg-*.txt")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name())
+	if _, err := tmp.WriteString(text); err != nil {
+		tmp.Close()
+		return err
+	}
+	tmp.Close()
+
+	// Use tmux load-buffer + paste-buffer as fallback for long text.
+	// Claude's TUI handles pasted text the same as typed text.
+	if err := exec.Command("tmux", "load-buffer", "-b", "ralph", tmp.Name()).Run(); err != nil {
+		return fmt.Errorf("load-buffer: %w", err)
+	}
+	if err := exec.Command("tmux", "paste-buffer", "-b", "ralph", "-t", session).Run(); err != nil {
+		return fmt.Errorf("paste-buffer: %w", err)
+	}
+
+	time.Sleep(200 * time.Millisecond)
+	return exec.Command("tmux", "send-keys", "-t", session, "Enter").Run()
+}
+
+// tmuxSessionExists checks if a tmux session is still alive.
+func tmuxSessionExists(session string) bool {
+	return exec.Command("tmux", "has-session", "-t", session).Run() == nil
+}
+
+// waitForClaudeReady polls the tmux pane until Claude shows its UI.
+func waitForClaudeReady(ctx context.Context, session string) bool {
+	deadline := time.After(30 * time.Second)
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return false
+		case <-deadline:
+			// Timeout — try anyway, Claude might be ready
+			return tmuxSessionExists(session)
+		case <-ticker.C:
+			if !tmuxSessionExists(session) {
+				return false
+			}
+			// Check if Claude's TUI is showing by looking for content in the pane
+			out, err := exec.Command("tmux", "capture-pane", "-t", session, "-p").Output()
+			if err != nil {
+				continue
+			}
+			content := strings.TrimSpace(string(out))
+			// Claude Code shows its UI when ready — any non-empty content means it's up
+			if len(content) > 10 {
+				// Give the TUI a moment to fully render
+				time.Sleep(1 * time.Second)
+				return true
+			}
+		}
+	}
+}
+
+// projectJSONLDir returns the Claude sessions directory for the given cwd.
+func projectJSONLDir(cwd string) string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	// Claude uses cwd with "/" replaced by "-" as the project identifier
+	projectID := strings.ReplaceAll(cwd, "/", "-")
+	return filepath.Join(home, ".claude", "projects", projectID)
+}
+
+// waitForNewJSONL waits for a new .jsonl file to appear in dir (created after 'after').
+func waitForNewJSONL(ctx context.Context, dir string, after time.Time) (string, error) {
+	deadline := time.After(60 * time.Second)
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-deadline:
+			return "", fmt.Errorf("timeout waiting for session JSONL in %s", dir)
+		case <-ticker.C:
+			entries, err := os.ReadDir(dir)
+			if err != nil {
+				continue
+			}
+			var newest string
+			var newestTime time.Time
+			for _, e := range entries {
+				if e.IsDir() || !strings.HasSuffix(e.Name(), ".jsonl") {
+					continue
+				}
+				info, err := e.Info()
+				if err != nil {
+					continue
+				}
+				if info.ModTime().After(after) && info.ModTime().After(newestTime) {
+					newest = filepath.Join(dir, e.Name())
+					newestTime = info.ModTime()
+				}
+			}
+			if newest != "" {
+				return newest, nil
+			}
+		}
+	}
+}
+
+// waitForTurnComplete watches the session JSONL for turn completion signals.
+// Uses multiple detection strategies:
+//   - system/turn_duration event (definitive, not always present)
+//   - idle timeout after assistant events (5s with no new events = turn done)
+//
+// Returns extracted assistant output for use by the steerer.
+func waitForTurnComplete(ctx context.Context, session, jsonlPath string) []byte {
+	if jsonlPath == "" {
+		return waitForTurnCompleteByPoll(ctx, session)
+	}
+
+	f, err := os.Open(jsonlPath)
+	if err != nil {
+		return waitForTurnCompleteByPoll(ctx, session)
+	}
+	defer f.Close()
+
+	// Seek to end — we only care about new events
+	f.Seek(0, io.SeekEnd)
+
+	reader := bufio.NewReader(f)
+	var turnOutput bytes.Buffer
+	var lastEventTime time.Time
+	sawAssistant := false
+	lastAssistantHadToolUse := false
+
+	for {
+		select {
+		case <-ctx.Done():
+			return turnOutput.Bytes()
+		default:
+		}
+
+		line, err := reader.ReadBytes('\n')
+		if err != nil {
+			// No new data
+			if !tmuxSessionExists(session) {
+				return turnOutput.Bytes()
+			}
+
+			// Idle detection: if we saw assistant events and nothing new for 5s
+			if sawAssistant && !lastAssistantHadToolUse && !lastEventTime.IsZero() {
+				idle := time.Since(lastEventTime)
+				if idle > 5*time.Second {
+					return turnOutput.Bytes()
+				}
+			}
+
+			// Safety: 10s after ANY event (including tool_use) with no new events
+			if !lastEventTime.IsZero() && time.Since(lastEventTime) > 10*time.Second {
+				return turnOutput.Bytes()
+			}
+
+			time.Sleep(300 * time.Millisecond)
+			continue
+		}
+
 		if len(line) == 0 {
 			continue
 		}
@@ -384,123 +635,74 @@ func Ralph(cfg RalphConfig, ev *Event) int {
 
 		evType := jsonString(raw, "type")
 		evSubtype := jsonString(raw, "subtype")
+		lastEventTime = time.Now()
 
-		switch evType {
-		case "assistant":
-			// Format and display (same as FormatStream)
-			formatAssistantEvent(raw, cfg.Stdout, &turnOutput, &lastWasTool)
+		// Definitive turn completion markers
+		if evType == "system" && evSubtype == "turn_duration" {
+			return turnOutput.Bytes()
+		}
 
-		case "result":
-			// Turn complete
-			turnDur := time.Since(turnStart)
-			printTurnSummary(cfg.Stderr, turn, turnDur, time.Since(loopStart))
+		// Capture assistant output for steering
+		if evType == "assistant" {
+			sawAssistant = true
+			lastAssistantHadToolUse = assistantHasToolUse(raw)
+			extractAssistantText(raw, &turnOutput)
+		}
 
-			// Check for .ralph-done
-			if _, err := os.Stat(cfg.DoneFile); err == nil {
-				totalDur := time.Since(loopStart)
-				fmt.Fprintf(cfg.Stderr, "=== done at turn %d (agent signaled completion) [%s] ===\n", turn, time.Now().Format("15:04:05"))
-				fmt.Fprintf(cfg.Stderr, "=== total time: %s ===\n", fmtDuration(totalDur))
-				stdinPipe.Close()
-				cmd.Wait()
-				if ev != nil {
-					ev.Iterations = turn
-					ev.RalphDone = true
-				}
-				return 0
-			}
-
-			// Max turns reached?
-			if turn >= cfg.MaxIter {
-				totalDur := time.Since(loopStart)
-				fmt.Fprintf(cfg.Stderr, "=== stopped at max turns (%d) [%s] ===\n", cfg.MaxIter, time.Now().Format("15:04:05"))
-				fmt.Fprintf(cfg.Stderr, "=== total time: %s ===\n", fmtDuration(totalDur))
-				stdinPipe.Close()
-				cmd.Wait()
-				if ev != nil {
-					ev.Iterations = turn
-				}
-				return 1
-			}
-
-			// Run steering on captured output
-			steerJSON := ""
-			if steerScript != "" && turnOutput.Len() > 0 {
-				var err error
-				steerJSON, err = runSteering(steerScript, turnOutput.Bytes(), cfg.StateFile)
-				if err != nil {
-					fmt.Fprintf(cfg.Stderr, "ralph: steering failed: %v\n", err)
-				} else {
-					fmt.Fprintf(cfg.Stderr, "ralph: steering: %s\n", steerJSON)
-				}
-			}
-
-			// Next turn
-			turn++
-			turnStart = time.Now()
-			turnOutput.Reset()
-			lastWasTool = false
-
-			fmt.Fprintf(cfg.Stderr, "=== turn %d/%d  [%s] ===\n", turn, cfg.MaxIter, time.Now().Format("15:04:05"))
-
-			// Build and send steering message
-			nextMsg := buildSteeringMessage(turn, cfg.MaxIter, steerJSON)
-			if err := sendUserMessage(stdinPipe, nextMsg); err != nil {
-				fmt.Fprintf(cfg.Stderr, "ralph: failed to send turn %d message: %v\n", turn, err)
-				break
-			}
-
-		case "system":
-			// Log init event
-			if evSubtype == "init" {
-				sessionID := jsonString(raw, "session_id")
-				if sessionID != "" {
-					fmt.Fprintf(cfg.Stderr, "ralph: session=%s\n", sessionID)
-				}
-			}
+		// Reset tool_use tracking on user events (tool results)
+		if evType == "user" {
+			lastAssistantHadToolUse = false
 		}
 	}
-
-	// Process exited
-	waitErr := cmd.Wait()
-	totalDur := time.Since(loopStart)
-
-	if ctx.Err() != nil {
-		fmt.Fprintf(cfg.Stderr, "\n=== interrupted ===\n")
-		if ev != nil {
-			ev.Iterations = turn
-		}
-		return 130
-	}
-
-	if waitErr != nil {
-		fmt.Fprintf(cfg.Stderr, "=== claude exited with error: %v [%s] ===\n", waitErr, fmtDuration(totalDur))
-		if ev != nil {
-			ev.Iterations = turn
-		}
-		return 1
-	}
-
-	// Check if done file was created in the final turn
-	if _, err := os.Stat(cfg.DoneFile); err == nil {
-		fmt.Fprintf(cfg.Stderr, "=== done at turn %d [%s] ===\n", turn, time.Now().Format("15:04:05"))
-		fmt.Fprintf(cfg.Stderr, "=== total time: %s ===\n", fmtDuration(totalDur))
-		if ev != nil {
-			ev.Iterations = turn
-			ev.RalphDone = true
-		}
-		return 0
-	}
-
-	fmt.Fprintf(cfg.Stderr, "=== session ended at turn %d [%s] ===\n", turn, fmtDuration(totalDur))
-	if ev != nil {
-		ev.Iterations = turn
-	}
-	return 1
 }
 
-// formatAssistantEvent processes an assistant event: formats text/tool_use to
-// the display writer and captures formatted text for the steering buffer.
-func formatAssistantEvent(raw map[string]json.RawMessage, display io.Writer, capture *bytes.Buffer, lastWasTool *bool) {
+// waitForTurnCompleteByPoll is the fallback when JSONL is unavailable.
+// Polls for .ralph-done or session death.
+func waitForTurnCompleteByPoll(ctx context.Context, session string) []byte {
+	// Without JSONL, we can't detect turn completion precisely.
+	// Poll for session death or .ralph-done as signals.
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+			if !tmuxSessionExists(session) {
+				return nil
+			}
+			if _, err := os.Stat(".ralph-done"); err == nil {
+				return nil
+			}
+		}
+	}
+}
+
+// assistantHasToolUse checks if an assistant event contains tool_use blocks.
+func assistantHasToolUse(raw map[string]json.RawMessage) bool {
+	msgRaw, ok := raw["message"]
+	if !ok {
+		return false
+	}
+	var msg struct {
+		Content []struct {
+			Type string `json:"type"`
+		} `json:"content"`
+	}
+	if err := json.Unmarshal(msgRaw, &msg); err != nil {
+		return false
+	}
+	for _, block := range msg.Content {
+		if block.Type == "tool_use" {
+			return true
+		}
+	}
+	return false
+}
+
+// extractAssistantText pulls text and tool info from an assistant event into the buffer.
+func extractAssistantText(raw map[string]json.RawMessage, buf *bytes.Buffer) {
 	msgRaw, ok := raw["message"]
 	if !ok {
 		return
@@ -521,36 +723,16 @@ func formatAssistantEvent(raw map[string]json.RawMessage, display io.Writer, cap
 	for _, block := range msg.Content {
 		switch block.Type {
 		case "text":
-			if block.Text == "" {
-				continue
+			if block.Text != "" {
+				fmt.Fprintln(buf, block.Text)
 			}
-			if *lastWasTool {
-				fmt.Fprint(display, "\n")
-				fmt.Fprint(capture, "\n")
-			}
-			fmt.Fprint(display, block.Text)
-			fmt.Fprint(capture, block.Text)
-			*lastWasTool = false
-
 		case "tool_use":
 			detail := extractToolDetail(block.Name, block.Input)
-			prefix := "\n"
-			if *lastWasTool {
-				prefix = ""
-			}
-			out := fmt.Sprintf("%s%s▶ %s", prefix, dim, block.Name)
 			if detail != "" {
-				out += "  " + detail
+				fmt.Fprintf(buf, "▶ %s  %s\n", block.Name, detail)
+			} else {
+				fmt.Fprintf(buf, "▶ %s\n", block.Name)
 			}
-			out += reset
-			fmt.Fprintln(display, out)
-			// Capture without ANSI codes for steering
-			plain := fmt.Sprintf("%s▶ %s", prefix, block.Name)
-			if detail != "" {
-				plain += "  " + detail
-			}
-			fmt.Fprintln(capture, plain)
-			*lastWasTool = true
 		}
 	}
 }
@@ -691,6 +873,10 @@ func jsonField(j, key string) string {
 		return ""
 	}
 	return j[start : start+end]
+}
+
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
 }
 
 func gitHead() string {

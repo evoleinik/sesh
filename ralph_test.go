@@ -109,66 +109,6 @@ func TestBuildSteeringMessage(t *testing.T) {
 	}
 }
 
-func TestSendUserMessage(t *testing.T) {
-	var buf bytes.Buffer
-	err := sendUserMessage(&buf, "hello world")
-	if err != nil {
-		t.Fatalf("sendUserMessage failed: %v", err)
-	}
-
-	var msg map[string]interface{}
-	if err := json.Unmarshal(buf.Bytes(), &msg); err != nil {
-		t.Fatalf("output not valid JSON: %v", err)
-	}
-
-	if msg["type"] != "user" {
-		t.Errorf("type = %v, want user", msg["type"])
-	}
-	inner := msg["message"].(map[string]interface{})
-	if inner["role"] != "user" {
-		t.Errorf("role = %v, want user", inner["role"])
-	}
-	if inner["content"] != "hello world" {
-		t.Errorf("content = %v, want hello world", inner["content"])
-	}
-}
-
-func TestFormatAssistantEvent(t *testing.T) {
-	// Text block
-	event := `{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Hello from Claude"}]}}`
-	var raw map[string]json.RawMessage
-	json.Unmarshal([]byte(event), &raw)
-
-	var display, capture bytes.Buffer
-	lastWasTool := false
-	formatAssistantEvent(raw, &display, &capture, &lastWasTool)
-
-	if !strings.Contains(display.String(), "Hello from Claude") {
-		t.Error("display should contain text")
-	}
-	if !strings.Contains(capture.String(), "Hello from Claude") {
-		t.Error("capture should contain text")
-	}
-
-	// Tool use block
-	display.Reset()
-	capture.Reset()
-	lastWasTool = false
-	event = `{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Bash","input":{"command":"ls -la"}}]}}`
-	json.Unmarshal([]byte(event), &raw)
-	formatAssistantEvent(raw, &display, &capture, &lastWasTool)
-
-	if !strings.Contains(display.String(), "▶ Bash") {
-		t.Error("display should contain tool indicator")
-	}
-	if !strings.Contains(capture.String(), "▶ Bash") {
-		t.Error("capture should contain tool indicator")
-	}
-	if !strings.Contains(capture.String(), "ls -la") {
-		t.Error("capture should contain command")
-	}
-}
-
 func TestJsonField(t *testing.T) {
 	j := `{"status":"progressing","action":"continue","reason":"work going well","directive":"keep at it"}`
 	tests := []struct {
@@ -269,6 +209,61 @@ func TestLastLine(t *testing.T) {
 		got := lastLine(tt.input)
 		if got != tt.want {
 			t.Errorf("lastLine(%q) = %q, want %q", tt.input, got, tt.want)
+		}
+	}
+}
+
+func TestProjectJSONLDir(t *testing.T) {
+	got := projectJSONLDir("/home/eo/src/airshelf-2")
+	if !strings.HasSuffix(got, "/.claude/projects/-home-eo-src-airshelf-2") {
+		t.Errorf("projectJSONLDir = %q, unexpected", got)
+	}
+
+	got = projectJSONLDir("/tmp")
+	if !strings.HasSuffix(got, "/.claude/projects/-tmp") {
+		t.Errorf("projectJSONLDir(/tmp) = %q, unexpected", got)
+	}
+}
+
+func TestExtractAssistantText(t *testing.T) {
+	// Text block
+	event := `{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Hello from Claude"}]}}`
+	var raw map[string]json.RawMessage
+	json.Unmarshal([]byte(event), &raw)
+
+	var buf bytes.Buffer
+	extractAssistantText(raw, &buf)
+
+	if !strings.Contains(buf.String(), "Hello from Claude") {
+		t.Error("should contain text")
+	}
+
+	// Tool use block
+	buf.Reset()
+	event = `{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Bash","input":{"command":"ls -la"}}]}}`
+	json.Unmarshal([]byte(event), &raw)
+	extractAssistantText(raw, &buf)
+
+	if !strings.Contains(buf.String(), "▶ Bash") {
+		t.Error("should contain tool indicator")
+	}
+	if !strings.Contains(buf.String(), "ls -la") {
+		t.Error("should contain command")
+	}
+}
+
+func TestShellQuote(t *testing.T) {
+	tests := []struct {
+		input, want string
+	}{
+		{"simple", "'simple'"},
+		{"it's", "'it'\\''s'"},
+		{"a=b", "'a=b'"},
+	}
+	for _, tt := range tests {
+		got := shellQuote(tt.input)
+		if got != tt.want {
+			t.Errorf("shellQuote(%q) = %q, want %q", tt.input, got, tt.want)
 		}
 	}
 }
