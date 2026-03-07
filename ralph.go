@@ -567,59 +567,71 @@ func waitForNewJSONL(ctx context.Context, dir string, after time.Time) (string, 
 	}
 }
 
-// waitForTurnComplete watches the session JSONL for turn completion signals.
-// Uses multiple detection strategies:
-//   - system/turn_duration event (definitive, not always present)
-//   - idle timeout after assistant events (5s with no new events = turn done)
+// waitForTurnComplete waits for Claude to finish its turn using the terminal
+// bell signal. Claude sends a BEL character (\a) when it completes a turn
+// and shows the input prompt. We use tmux's alert-bell hook + wait-for
+// channel to block until the bell fires. No polling, no timeouts.
 //
-// Returns extracted assistant output for use by the steerer.
+// A background goroutine tails the JSONL to capture assistant output
+// for the steerer.
 func waitForTurnComplete(ctx context.Context, session, jsonlPath string) []byte {
-	if jsonlPath == "" {
-		return waitForTurnCompleteByPoll(ctx, session)
+	var turnOutput bytes.Buffer
+
+	// Start JSONL tailer to capture assistant output
+	tailCtx, tailCancel := context.WithCancel(ctx)
+	defer tailCancel()
+	if jsonlPath != "" {
+		go tailJSONLForOutput(tailCtx, jsonlPath, &turnOutput)
 	}
 
+	// Use unique channel name per turn to avoid stale signals
+	channel := fmt.Sprintf("ralph-bell-%s-%d", session, time.Now().UnixNano())
+
+	// Set up tmux hook: when bell fires, signal the wait-for channel
+	hookCmd := fmt.Sprintf("run-shell 'tmux wait-for -S %s'", channel)
+	exec.Command("tmux", "set-hook", "-t", session, "alert-bell", hookCmd).Run()
+
+	// Wait for the bell (blocks until Claude finishes)
+	done := make(chan error, 1)
+	go func() {
+		done <- exec.Command("tmux", "wait-for", channel).Run()
+	}()
+
+	select {
+	case <-done:
+		// Bell fired — turn complete
+		tailCancel()
+		time.Sleep(300 * time.Millisecond) // let tailer flush
+		return turnOutput.Bytes()
+	case <-ctx.Done():
+		// Interrupted
+		// Unblock the wait-for so the goroutine can exit
+		exec.Command("tmux", "wait-for", "-S", channel).Run()
+		return turnOutput.Bytes()
+	}
+}
+
+// tailJSONLForOutput reads new JSONL events and extracts assistant text
+// into the buffer for steering. Runs until context is cancelled.
+func tailJSONLForOutput(ctx context.Context, jsonlPath string, buf *bytes.Buffer) {
 	f, err := os.Open(jsonlPath)
 	if err != nil {
-		return waitForTurnCompleteByPoll(ctx, session)
+		return
 	}
 	defer f.Close()
 
-	// Seek to end — we only care about new events
 	f.Seek(0, io.SeekEnd)
-
 	reader := bufio.NewReader(f)
-	var turnOutput bytes.Buffer
-	var lastEventTime time.Time
-	sawAssistant := false
-	lastAssistantHadToolUse := false
 
 	for {
 		select {
 		case <-ctx.Done():
-			return turnOutput.Bytes()
+			return
 		default:
 		}
 
 		line, err := reader.ReadBytes('\n')
 		if err != nil {
-			// No new data
-			if !tmuxSessionExists(session) {
-				return turnOutput.Bytes()
-			}
-
-			// Idle detection: if we saw assistant events and nothing new for 5s
-			if sawAssistant && !lastAssistantHadToolUse && !lastEventTime.IsZero() {
-				idle := time.Since(lastEventTime)
-				if idle > 5*time.Second {
-					return turnOutput.Bytes()
-				}
-			}
-
-			// Safety: 10s after ANY event (including tool_use) with no new events
-			if !lastEventTime.IsZero() && time.Since(lastEventTime) > 10*time.Second {
-				return turnOutput.Bytes()
-			}
-
 			time.Sleep(300 * time.Millisecond)
 			continue
 		}
@@ -633,25 +645,8 @@ func waitForTurnComplete(ctx context.Context, session, jsonlPath string) []byte 
 			continue
 		}
 
-		evType := jsonString(raw, "type")
-		evSubtype := jsonString(raw, "subtype")
-		lastEventTime = time.Now()
-
-		// Definitive turn completion markers
-		if evType == "system" && evSubtype == "turn_duration" {
-			return turnOutput.Bytes()
-		}
-
-		// Capture assistant output for steering
-		if evType == "assistant" {
-			sawAssistant = true
-			lastAssistantHadToolUse = assistantHasToolUse(raw)
-			extractAssistantText(raw, &turnOutput)
-		}
-
-		// Reset tool_use tracking on user events (tool results)
-		if evType == "user" {
-			lastAssistantHadToolUse = false
+		if jsonString(raw, "type") == "assistant" {
+			extractAssistantText(raw, buf)
 		}
 	}
 }
@@ -677,28 +672,6 @@ func waitForTurnCompleteByPoll(ctx context.Context, session string) []byte {
 			}
 		}
 	}
-}
-
-// assistantHasToolUse checks if an assistant event contains tool_use blocks.
-func assistantHasToolUse(raw map[string]json.RawMessage) bool {
-	msgRaw, ok := raw["message"]
-	if !ok {
-		return false
-	}
-	var msg struct {
-		Content []struct {
-			Type string `json:"type"`
-		} `json:"content"`
-	}
-	if err := json.Unmarshal(msgRaw, &msg); err != nil {
-		return false
-	}
-	for _, block := range msg.Content {
-		if block.Type == "tool_use" {
-			return true
-		}
-	}
-	return false
 }
 
 // extractAssistantText pulls text and tool info from an assistant event into the buffer.
