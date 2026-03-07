@@ -16,7 +16,7 @@ func TestBuildPrompt(t *testing.T) {
 	os.WriteFile(promptFile, []byte("Do the thing.\n"), 0644)
 	os.WriteFile(stateFile, []byte("# Ralph State\n\n## DONE\n- step 1\n"), 0644)
 
-	got := buildPrompt(3, 10, stateFile, promptFile, "", 0, false)
+	got := buildPrompt(3, 10, stateFile, promptFile, "", 0, false, "")
 
 	if !strings.Contains(got, "iteration 3 of 10") {
 		t.Error("prompt should contain iteration number")
@@ -46,7 +46,7 @@ func TestBuildPromptNoState(t *testing.T) {
 
 	os.WriteFile(promptFile, []byte("Do the thing.\n"), 0644)
 
-	got := buildPrompt(1, 5, stateFile, promptFile, "", 0, false)
+	got := buildPrompt(1, 5, stateFile, promptFile, "", 0, false, "")
 
 	if strings.Contains(got, "## CURRENT STATE — READ THIS FIRST") {
 		t.Error("prompt should NOT contain state section when file absent")
@@ -62,13 +62,13 @@ func TestBuildPromptStallWarning(t *testing.T) {
 	os.WriteFile(promptFile, []byte("Do the thing.\n"), 0644)
 
 	// No stall warning at stallCount < 3
-	got := buildPrompt(5, 10, filepath.Join(dir, "state.md"), promptFile, "", 2, false)
+	got := buildPrompt(5, 10, filepath.Join(dir, "state.md"), promptFile, "", 2, false, "")
 	if strings.Contains(got, "STALL DETECTED") {
 		t.Error("should NOT show stall warning at stallCount=2")
 	}
 
 	// Stall warning at stallCount >= 3
-	got = buildPrompt(5, 10, filepath.Join(dir, "state.md"), promptFile, "", 3, false)
+	got = buildPrompt(5, 10, filepath.Join(dir, "state.md"), promptFile, "", 3, false, "")
 	if !strings.Contains(got, "STALL DETECTED") {
 		t.Error("should show stall warning at stallCount=3")
 	}
@@ -77,12 +77,36 @@ func TestBuildPromptStallWarning(t *testing.T) {
 	}
 }
 
+func TestBuildPromptSteering(t *testing.T) {
+	dir := t.TempDir()
+	promptFile := filepath.Join(dir, "prompt.md")
+	os.WriteFile(promptFile, []byte("Do the thing.\n"), 0644)
+
+	steerJSON := `{"status":"stalled","action":"redirect","reason":"3 iterations no progress","directive":"scope down"}`
+
+	// With steering, should include steering section
+	got := buildPrompt(3, 10, filepath.Join(dir, "state.md"), promptFile, "", 5, false, steerJSON)
+	if !strings.Contains(got, "### Steering Signal") {
+		t.Error("should contain steering signal header")
+	}
+	if !strings.Contains(got, "**Status:** stalled") {
+		t.Error("should contain parsed status")
+	}
+	if !strings.Contains(got, "**Directive:** scope down") {
+		t.Error("should contain parsed directive")
+	}
+	// Should NOT contain stall warning when steering is active (even with stallCount=5)
+	if strings.Contains(got, "STALL DETECTED") {
+		t.Error("should NOT show stall warning when steering is active")
+	}
+}
+
 func TestBuildPromptPlanMode(t *testing.T) {
 	dir := t.TempDir()
 	promptFile := filepath.Join(dir, "plan.md")
 	os.WriteFile(promptFile, []byte("# My Plan\n\nDo X then Y.\n"), 0644)
 
-	got := buildPrompt(2, 5, filepath.Join(dir, "state.md"), promptFile, "", 0, true)
+	got := buildPrompt(2, 5, filepath.Join(dir, "state.md"), promptFile, "", 0, true, "")
 
 	// Should use plan preamble, not execution preamble
 	if !strings.Contains(got, "Planning Loop") {
@@ -160,13 +184,52 @@ func TestBuildPromptInline(t *testing.T) {
 	dir := t.TempDir()
 	stateFile := filepath.Join(dir, "ralph-state.md")
 
-	got := buildPrompt(1, 3, stateFile, "", "Build a REST API", 0, false)
+	got := buildPrompt(1, 3, stateFile, "", "Build a REST API", 0, false, "")
 
 	if !strings.Contains(got, "Build a REST API") {
 		t.Error("prompt should contain inline text")
 	}
 	if !strings.Contains(got, "iteration 1 of 3") {
 		t.Error("prompt should contain iteration number")
+	}
+}
+
+func TestJsonField(t *testing.T) {
+	json := `{"status":"progressing","action":"continue","reason":"work going well","directive":"keep at it"}`
+	tests := []struct {
+		key, want string
+	}{
+		{"status", "progressing"},
+		{"action", "continue"},
+		{"reason", "work going well"},
+		{"directive", "keep at it"},
+		{"missing", ""},
+	}
+	for _, tt := range tests {
+		got := jsonField(json, tt.key)
+		if got != tt.want {
+			t.Errorf("jsonField(%q) = %q, want %q", tt.key, got, tt.want)
+		}
+	}
+}
+
+func TestResolveSteerScript(t *testing.T) {
+	// "none" disables
+	if got := resolveSteerScript("none"); got != "" {
+		t.Errorf("none should return empty, got %q", got)
+	}
+
+	// nonexistent explicit path returns empty
+	if got := resolveSteerScript("/nonexistent/steer.sh"); got != "" {
+		t.Errorf("missing explicit should return empty, got %q", got)
+	}
+
+	// existing explicit path returns it
+	dir := t.TempDir()
+	script := filepath.Join(dir, "steer.sh")
+	os.WriteFile(script, []byte("#!/bin/bash\n"), 0755)
+	if got := resolveSteerScript(script); got != script {
+		t.Errorf("explicit should return path, got %q", got)
 	}
 }
 
