@@ -1,8 +1,6 @@
 package main
 
 import (
-	"bytes"
-	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,7 +8,7 @@ import (
 	"time"
 )
 
-func TestBuildInitialPrompt(t *testing.T) {
+func TestBuildPrompt(t *testing.T) {
 	dir := t.TempDir()
 	promptFile := filepath.Join(dir, "prompt.md")
 	stateFile := filepath.Join(dir, "ralph-state.md")
@@ -18,94 +16,175 @@ func TestBuildInitialPrompt(t *testing.T) {
 	os.WriteFile(promptFile, []byte("Do the thing.\n"), 0644)
 	os.WriteFile(stateFile, []byte("# Ralph State\n\n## DONE\n- step 1\n"), 0644)
 
-	cfg := RalphConfig{
-		PromptFile: promptFile,
-		StateFile:  stateFile,
-		MaxIter:    10,
-	}
-	got := buildInitialPrompt(cfg)
+	got := buildPrompt(3, 10, stateFile, promptFile, "", 0, false, "")
 
+	if !strings.Contains(got, "iteration 3 of 10") {
+		t.Error("prompt should contain iteration number")
+	}
 	if !strings.Contains(got, "Do the thing.") {
-		t.Error("should contain user prompt")
+		t.Error("prompt should contain user prompt")
+	}
+	stateHeader := "## CURRENT STATE — READ THIS FIRST"
+	if !strings.Contains(got, stateHeader) {
+		t.Error("prompt should contain state header")
 	}
 	if !strings.Contains(got, "step 1") {
-		t.Error("should contain state content")
+		t.Error("prompt should contain state content")
+	}
+	// State should come after the user prompt (recency bias)
+	promptIdx := strings.Index(got, "Do the thing.")
+	stateIdx := strings.Index(got, stateHeader)
+	if stateIdx < promptIdx {
+		t.Error("state should come after user prompt for recency bias")
 	}
 }
 
-func TestBuildInitialPromptNoState(t *testing.T) {
+func TestBuildPromptNoState(t *testing.T) {
+	dir := t.TempDir()
+	promptFile := filepath.Join(dir, "prompt.md")
+	stateFile := filepath.Join(dir, "ralph-state.md") // does not exist
+
+	os.WriteFile(promptFile, []byte("Do the thing.\n"), 0644)
+
+	got := buildPrompt(1, 5, stateFile, promptFile, "", 0, false, "")
+
+	if strings.Contains(got, "## CURRENT STATE — READ THIS FIRST") {
+		t.Error("prompt should NOT contain state section when file absent")
+	}
+	if !strings.Contains(got, "Do the thing.") {
+		t.Error("prompt should still contain user prompt")
+	}
+}
+
+func TestBuildPromptStallWarning(t *testing.T) {
 	dir := t.TempDir()
 	promptFile := filepath.Join(dir, "prompt.md")
 	os.WriteFile(promptFile, []byte("Do the thing.\n"), 0644)
 
-	cfg := RalphConfig{
-		PromptFile: promptFile,
-		StateFile:  filepath.Join(dir, "nonexistent.md"),
-		MaxIter:    5,
+	// No stall warning at stallCount < 3
+	got := buildPrompt(5, 10, filepath.Join(dir, "state.md"), promptFile, "", 2, false, "")
+	if strings.Contains(got, "STALL DETECTED") {
+		t.Error("should NOT show stall warning at stallCount=2")
 	}
-	got := buildInitialPrompt(cfg)
 
-	if !strings.Contains(got, "Do the thing.") {
-		t.Error("should contain user prompt")
+	// Stall warning at stallCount >= 3
+	got = buildPrompt(5, 10, filepath.Join(dir, "state.md"), promptFile, "", 3, false, "")
+	if !strings.Contains(got, "STALL DETECTED") {
+		t.Error("should show stall warning at stallCount=3")
 	}
-	if strings.Contains(got, "CURRENT STATE — READ THIS FIRST") {
-		t.Error("should NOT contain state section when file absent")
+	if !strings.Contains(got, "3 consecutive iterations") {
+		t.Error("stall warning should mention count")
 	}
 }
 
-func TestBuildInitialPromptInline(t *testing.T) {
+func TestBuildPromptSteering(t *testing.T) {
 	dir := t.TempDir()
-	cfg := RalphConfig{
-		PromptText: "Build a REST API",
-		StateFile:  filepath.Join(dir, "state.md"),
-		MaxIter:    3,
+	promptFile := filepath.Join(dir, "prompt.md")
+	os.WriteFile(promptFile, []byte("Do the thing.\n"), 0644)
+
+	steerJSON := `{"status":"stalled","action":"redirect","reason":"3 iterations no progress","directive":"scope down"}`
+
+	got := buildPrompt(3, 10, filepath.Join(dir, "state.md"), promptFile, "", 5, false, steerJSON)
+	if !strings.Contains(got, "### Steering Signal") {
+		t.Error("should contain steering signal header")
 	}
-	got := buildInitialPrompt(cfg)
+	if !strings.Contains(got, "**Status:** stalled") {
+		t.Error("should contain parsed status")
+	}
+	if !strings.Contains(got, "**Directive:** scope down") {
+		t.Error("should contain parsed directive")
+	}
+	// Should NOT contain stall warning when steering is active
+	if strings.Contains(got, "STALL DETECTED") {
+		t.Error("should NOT show stall warning when steering is active")
+	}
+}
+
+func TestBuildPromptPlanMode(t *testing.T) {
+	dir := t.TempDir()
+	promptFile := filepath.Join(dir, "plan.md")
+	os.WriteFile(promptFile, []byte("# My Plan\n\nDo X then Y.\n"), 0644)
+
+	got := buildPrompt(2, 5, filepath.Join(dir, "state.md"), promptFile, "", 0, true, "")
+
+	if !strings.Contains(got, "Planning Loop") {
+		t.Error("plan mode should use planning preamble")
+	}
+	if strings.Contains(got, "Ralph Loop Context") {
+		t.Error("plan mode should NOT use execution preamble")
+	}
+	if !strings.Contains(got, "Iteration 2 of 5") {
+		t.Error("plan preamble should contain iteration number")
+	}
+	if !strings.Contains(got, "Do X then Y") {
+		t.Error("plan prompt should contain user content")
+	}
+}
+
+func TestBuildPromptInline(t *testing.T) {
+	dir := t.TempDir()
+	stateFile := filepath.Join(dir, "ralph-state.md")
+
+	got := buildPrompt(1, 3, stateFile, "", "Build a REST API", 0, false, "")
 
 	if !strings.Contains(got, "Build a REST API") {
-		t.Error("should contain inline text")
+		t.Error("prompt should contain inline text")
+	}
+	if !strings.Contains(got, "iteration 1 of 3") {
+		t.Error("prompt should contain iteration number")
 	}
 }
 
-func TestBuildSteeringMessage(t *testing.T) {
-	// Progressing
-	steerJSON := `{"status":"progressing","action":"continue","reason":"good progress","directive":"keep going"}`
-	got := buildSteeringMessage(3, 10, steerJSON)
-	if !strings.Contains(got, "Turn 3 of 10") {
-		t.Error("should contain turn number")
+func TestGenerateFallbackState(t *testing.T) {
+	dir := t.TempDir()
+	stateFile := filepath.Join(dir, "ralph-state.md")
+
+	generateFallbackState(3, stateFile)
+
+	data, err := os.ReadFile(stateFile)
+	if err != nil {
+		t.Fatalf("fallback state not written: %v", err)
 	}
-	if !strings.Contains(got, "keep going") {
-		t.Error("should contain directive for progressing status")
+	content := string(data)
+
+	for _, section := range []string{"## DONE", "## TODO", "## BLOCKED", "## NOTES", "## LEARNINGS"} {
+		if !strings.Contains(content, section) {
+			t.Errorf("fallback state missing section: %s", section)
+		}
+	}
+	if !strings.Contains(content, "iteration 3") {
+		t.Error("fallback state should mention iteration number")
+	}
+}
+
+func TestRunRalphBadArgs(t *testing.T) {
+	code := runRalph(nil)
+	if code != 1 {
+		t.Errorf("no args: got exit %d, want 1", code)
 	}
 
-	// Stalled
-	steerJSON = `{"status":"stalled","action":"redirect","reason":"no commits in 3 turns","directive":"scope down and commit something"}`
-	got = buildSteeringMessage(5, 10, steerJSON)
-	if !strings.Contains(got, "stalled") {
-		t.Error("should mention stalled")
-	}
-	if !strings.Contains(got, "scope down") {
-		t.Error("should contain directive")
+	code = runRalph([]string{"/tmp/nonexistent-ralph-test-prompt.md"})
+	if code != 1 {
+		t.Errorf("missing file: got exit %d, want 1", code)
 	}
 
-	// Wrong
-	steerJSON = `{"status":"wrong","action":"deepen","reason":"thrashing with reverts","directive":"stop and diagnose"}`
-	got = buildSteeringMessage(4, 10, steerJSON)
-	if !strings.Contains(got, "WARNING") {
-		t.Error("should contain WARNING for wrong status")
+	dir := t.TempDir()
+	f := filepath.Join(dir, "p.md")
+	os.WriteFile(f, []byte("test"), 0644)
+
+	code = runRalph([]string{f, "abc"})
+	if code != 1 {
+		t.Errorf("bad max: got exit %d, want 1", code)
 	}
 
-	// Done
-	steerJSON = `{"status":"done","action":"complete","reason":"all tasks done","directive":"create .ralph-done"}`
-	got = buildSteeringMessage(8, 10, steerJSON)
-	if !strings.Contains(got, "complete") {
-		t.Error("should mention completion")
+	code = runRalph([]string{f, "0"})
+	if code != 1 {
+		t.Errorf("zero max: got exit %d, want 1", code)
 	}
 
-	// No steering
-	got = buildSteeringMessage(2, 10, "")
-	if !strings.Contains(got, "Continue working") {
-		t.Error("should have generic continue message without steering")
+	code = runRalph([]string{"-p"})
+	if code != 1 {
+		t.Errorf("-p without value: got exit %d, want 1", code)
 	}
 }
 
@@ -145,37 +224,6 @@ func TestResolveSteerScript(t *testing.T) {
 	}
 }
 
-func TestRunRalphBadArgs(t *testing.T) {
-	code := runRalph(nil)
-	if code != 1 {
-		t.Errorf("no args: got exit %d, want 1", code)
-	}
-
-	code = runRalph([]string{"/tmp/nonexistent-ralph-test-prompt.md"})
-	if code != 1 {
-		t.Errorf("missing file: got exit %d, want 1", code)
-	}
-
-	dir := t.TempDir()
-	f := filepath.Join(dir, "p.md")
-	os.WriteFile(f, []byte("test"), 0644)
-
-	code = runRalph([]string{f, "abc"})
-	if code != 1 {
-		t.Errorf("bad max: got exit %d, want 1", code)
-	}
-
-	code = runRalph([]string{f, "0"})
-	if code != 1 {
-		t.Errorf("zero max: got exit %d, want 1", code)
-	}
-
-	code = runRalph([]string{"-p"})
-	if code != 1 {
-		t.Errorf("-p without value: got exit %d, want 1", code)
-	}
-}
-
 func TestFmtDuration(t *testing.T) {
 	tests := []struct {
 		secs int
@@ -209,61 +257,6 @@ func TestLastLine(t *testing.T) {
 		got := lastLine(tt.input)
 		if got != tt.want {
 			t.Errorf("lastLine(%q) = %q, want %q", tt.input, got, tt.want)
-		}
-	}
-}
-
-func TestProjectJSONLDir(t *testing.T) {
-	got := projectJSONLDir("/home/eo/src/airshelf-2")
-	if !strings.HasSuffix(got, "/.claude/projects/-home-eo-src-airshelf-2") {
-		t.Errorf("projectJSONLDir = %q, unexpected", got)
-	}
-
-	got = projectJSONLDir("/tmp")
-	if !strings.HasSuffix(got, "/.claude/projects/-tmp") {
-		t.Errorf("projectJSONLDir(/tmp) = %q, unexpected", got)
-	}
-}
-
-func TestExtractAssistantText(t *testing.T) {
-	// Text block
-	event := `{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Hello from Claude"}]}}`
-	var raw map[string]json.RawMessage
-	json.Unmarshal([]byte(event), &raw)
-
-	var buf bytes.Buffer
-	extractAssistantText(raw, &buf)
-
-	if !strings.Contains(buf.String(), "Hello from Claude") {
-		t.Error("should contain text")
-	}
-
-	// Tool use block
-	buf.Reset()
-	event = `{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Bash","input":{"command":"ls -la"}}]}}`
-	json.Unmarshal([]byte(event), &raw)
-	extractAssistantText(raw, &buf)
-
-	if !strings.Contains(buf.String(), "▶ Bash") {
-		t.Error("should contain tool indicator")
-	}
-	if !strings.Contains(buf.String(), "ls -la") {
-		t.Error("should contain command")
-	}
-}
-
-func TestShellQuote(t *testing.T) {
-	tests := []struct {
-		input, want string
-	}{
-		{"simple", "'simple'"},
-		{"it's", "'it'\\''s'"},
-		{"a=b", "'a=b'"},
-	}
-	for _, tt := range tests {
-		got := shellQuote(tt.input)
-		if got != tt.want {
-			t.Errorf("shellQuote(%q) = %q, want %q", tt.input, got, tt.want)
 		}
 	}
 }

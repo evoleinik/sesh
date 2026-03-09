@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"context"
 	_ "embed"
-	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -24,18 +23,28 @@ var defaultPreamble string
 //go:embed prompts/ralph-plan-preamble.md
 var defaultPlanPreamble string
 
+// IterResult captures what happened in a single claude iteration.
+type IterResult struct {
+	ExitCode     int
+	Duration     time.Duration
+	Interrupted  bool   // context was cancelled
+	DoneFile     bool   // .ralph-done exists after iteration
+	StateWritten bool   // ralph-state.md exists after iteration
+	Output       []byte // captured formatted output from this iteration
+}
+
 // RalphConfig controls the ralph loop.
 type RalphConfig struct {
 	PromptFile  string
 	PromptText  string    // inline prompt via -p (used if PromptFile empty)
-	MaxIter     int       // max steering turns
-	MaxTurns    int       // Claude Code --max-turns (tool call budget)
+	MaxIter     int
+	MaxTurns    int       // Claude Code --max-turns per iteration (default 100)
 	PlanMode    bool      // use adversarial planning preamble
 	EnvFile     string    // .env file to source before each iteration
 	SteerScript string    // path to steering script ("" = auto-detect, "none" = disabled)
 	StateFile   string
 	DoneFile    string
-	Stdout      io.Writer // status output (default: os.Stdout)
+	Stdout      io.Writer // FormatStream output (default: os.Stdout)
 	Stderr      io.Writer // ralph metadata output (default: os.Stderr)
 }
 
@@ -197,10 +206,9 @@ func runRalph(args []string) int {
 	return code
 }
 
-// Ralph runs Claude in a tmux session with LLM-based steering between turns.
-// The user can attach to the tmux session to watch Claude work in the native TUI.
-// A background watcher monitors the session JSONL for turn completion and
-// sends steering messages as follow-up prompts.
+// Ralph runs the iteration loop. Each iteration spawns a fresh claude process
+// with the full prompt via `claude -p --output-format stream-json`.
+// Returns exit code.
 func Ralph(cfg RalphConfig, ev *Event) int {
 	if cfg.StateFile == "" {
 		cfg.StateFile = "ralph-state.md"
@@ -224,6 +232,7 @@ func Ralph(cfg RalphConfig, ev *Event) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// After first Ctrl+C: unregister NotifyContext, then hard-exit on next signal.
 	go func() {
 		<-ctx.Done()
 		stop()
@@ -233,12 +242,6 @@ func Ralph(cfg RalphConfig, ev *Event) int {
 		fmt.Fprintf(cfg.Stderr, "\nforce quit\n")
 		os.Exit(130)
 	}()
-
-	// Check tmux
-	if _, err := exec.LookPath("tmux"); err != nil {
-		fmt.Fprintln(cfg.Stderr, "ralph: tmux is required")
-		return 1
-	}
 
 	cwd, _ := os.Getwd()
 	mode := "execute"
@@ -253,7 +256,7 @@ func Ralph(cfg RalphConfig, ev *Event) int {
 		}
 	}
 
-	// Load env file
+	// Load env file (explicit or auto-detect .env in cwd)
 	var extraEnv []string
 	envSource := cfg.EnvFile
 	if envSource == "" {
@@ -271,521 +274,237 @@ func Ralph(cfg RalphConfig, ev *Event) int {
 		}
 	}
 
-	// Resolve steering
+	// Resolve steering script
 	steerScript := resolveSteerScript(cfg.SteerScript)
 	if steerScript != "" {
 		fmt.Fprintf(cfg.Stderr, "ralph: steering=%s\n", steerScript)
 	}
 
-	// Create tmux session
-	sessionName := fmt.Sprintf("ralph-%d", time.Now().UnixMilli()%100000)
-
-	// Build claude command
-	claudeArgs := []string{"--dangerously-skip-permissions"}
-	if cfg.MaxTurns > 0 {
-		claudeArgs = append(claudeArgs, "--max-turns", strconv.Itoa(cfg.MaxTurns))
-	}
-
-	// Build shell command for tmux (unset CLAUDECODE to allow nested sessions)
-	var envPrefix string
-	if len(extraEnv) > 0 {
-		// Export env vars in the shell command
-		var exports []string
-		for _, kv := range extraEnv {
-			exports = append(exports, fmt.Sprintf("export %s", shellQuote(kv)))
-		}
-		envPrefix = strings.Join(exports, "; ") + "; "
-	}
-	claudeCmd := fmt.Sprintf("env -u CLAUDECODE claude %s", strings.Join(claudeArgs, " "))
-	shellCmd := fmt.Sprintf("%s%s", envPrefix, claudeCmd)
-
 	fmt.Fprintf(cfg.Stderr, "ralph: prompt=%s max=%d mode=%s cwd=%s\n", label, cfg.MaxIter, mode, cwd)
-	fmt.Fprintf(cfg.Stderr, "ralph: tmux session (native Claude TUI)\n")
-	fmt.Fprintf(cfg.Stderr, "ralph: started at %s\n", time.Now().Format("2006-01-02 15:04:05"))
+	fmt.Fprintf(cfg.Stderr, "ralph: started at %s\n\n", time.Now().Format("2006-01-02 15:04:05"))
 
-	if err := exec.Command("tmux", "new-session", "-d",
-		"-s", sessionName,
-		"-x", "200", "-y", "50",
-		shellCmd,
-	).Run(); err != nil {
-		fmt.Fprintf(cfg.Stderr, "ralph: failed to create tmux session: %v\n", err)
-		return 1
-	}
-	defer func() {
-		exec.Command("tmux", "kill-session", "-t", sessionName).Run()
-	}()
+	lastHead := gitHead()
+	stallCount := 0
+	var lastOutput []byte
 
-	fmt.Fprintf(cfg.Stderr, "ralph: session=%s\n", sessionName)
-	fmt.Fprintf(cfg.Stderr, "ralph: watch with: tmux attach -t %s\n\n", sessionName)
-
-	// Wait for Claude to be ready
-	if !waitForClaudeReady(ctx, sessionName) {
-		fmt.Fprintln(cfg.Stderr, "ralph: claude failed to start")
-		return 1
-	}
-
-	// Send initial prompt
-	initialPrompt := buildInitialPrompt(cfg)
-	fmt.Fprintf(cfg.Stderr, "=== turn 1/%d  [%s] ===\n", cfg.MaxIter, time.Now().Format("15:04:05"))
-	if err := tmuxSendText(sessionName, initialPrompt); err != nil {
-		fmt.Fprintf(cfg.Stderr, "ralph: failed to send initial prompt: %v\n", err)
-		return 1
-	}
-
-	// Find the session JSONL file
-	jsonlDir := projectJSONLDir(cwd)
-	jsonlPath := ""
-	if jsonlDir != "" {
-		var err error
-		jsonlPath, err = waitForNewJSONL(ctx, jsonlDir, loopStart)
-		if err != nil {
-			fmt.Fprintf(cfg.Stderr, "ralph: warning: could not find session JSONL: %v\n", err)
-		} else {
-			fmt.Fprintf(cfg.Stderr, "ralph: watching %s\n", filepath.Base(jsonlPath))
+	for i := 1; i <= cfg.MaxIter; i++ {
+		if ctx.Err() != nil {
+			fmt.Fprintf(cfg.Stderr, "\n=== interrupted ===\n")
+			if ev != nil {
+				ev.Iterations = i - 1
+			}
+			return 130
 		}
-	}
 
-	// Main turn loop
-	turn := 1
-	turnStart := time.Now()
+		fmt.Fprintf(cfg.Stderr, "=== iteration %d/%d  [%s] ===\n", i, cfg.MaxIter, time.Now().Format("15:04:05"))
 
-	for turn <= cfg.MaxIter {
-		// Wait for turn to complete
-		turnOutput := waitForTurnComplete(ctx, sessionName, jsonlPath)
+		killStaleServers()
 
-		turnDur := time.Since(turnStart)
-		printTurnSummary(cfg.Stderr, turn, turnDur, time.Since(loopStart))
+		// Steering: observe what the worker actually did last iteration
+		steerOutput := ""
+		if steerScript != "" && i > 1 && len(lastOutput) > 0 {
+			var err error
+			steerOutput, err = runSteering(steerScript, lastOutput, cfg)
+			if err != nil {
+				fmt.Fprintf(cfg.Stderr, "ralph: steering failed: %v\n", err)
+			} else {
+				fmt.Fprintf(cfg.Stderr, "ralph: steering: %s\n", steerOutput)
+			}
+		}
 
-		// Check .ralph-done
-		if _, err := os.Stat(cfg.DoneFile); err == nil {
+		prompt := buildPrompt(i, cfg.MaxIter, cfg.StateFile, cfg.PromptFile, cfg.PromptText, stallCount, cfg.PlanMode, steerOutput)
+		result := RunIteration(ctx, prompt, cfg.MaxTurns, extraEnv, cfg.Stdout)
+		lastOutput = result.Output
+
+		// stall detection: did git HEAD change?
+		head := gitHead()
+		if head == lastHead {
+			stallCount++
+			if stallCount >= 3 {
+				fmt.Fprintf(cfg.Stderr, "ralph: WARNING — %d consecutive iterations with no commits\n", stallCount)
+			}
+		} else {
+			stallCount = 0
+			lastHead = head
+		}
+
+		printIterSummary(cfg.Stderr, i, result, time.Since(loopStart))
+
+		if result.Interrupted {
+			fmt.Fprintf(cfg.Stderr, "\n=== interrupted ===\n")
+			if ev != nil {
+				ev.Iterations = i
+			}
+			return 130
+		}
+
+		if result.DoneFile {
 			totalDur := time.Since(loopStart)
-			fmt.Fprintf(cfg.Stderr, "=== done at turn %d (agent signaled completion) [%s] ===\n", turn, time.Now().Format("15:04:05"))
+			fmt.Fprintf(cfg.Stderr, "=== done at iteration %d (agent signaled completion) [%s] ===\n", i, time.Now().Format("15:04:05"))
 			fmt.Fprintf(cfg.Stderr, "=== total time: %s ===\n", fmtDuration(totalDur))
 			if ev != nil {
-				ev.Iterations = turn
+				ev.Iterations = i
 				ev.RalphDone = true
 			}
 			return 0
 		}
 
-		// Max turns?
-		if turn >= cfg.MaxIter {
-			totalDur := time.Since(loopStart)
-			fmt.Fprintf(cfg.Stderr, "=== stopped at max turns (%d) [%s] ===\n", cfg.MaxIter, time.Now().Format("15:04:05"))
-			fmt.Fprintf(cfg.Stderr, "=== total time: %s ===\n", fmtDuration(totalDur))
-			if ev != nil {
-				ev.Iterations = turn
-			}
-			return 0
-		}
-
-		// Check if tmux session still exists (Claude exited)
-		if !tmuxSessionExists(sessionName) {
-			totalDur := time.Since(loopStart)
-			fmt.Fprintf(cfg.Stderr, "=== claude exited at turn %d [%s] ===\n", turn, fmtDuration(totalDur))
-			if ev != nil {
-				ev.Iterations = turn
-			}
-			return 1
-		}
-
-		// Run steering on captured output
-		steerJSON := ""
-		if steerScript != "" && len(turnOutput) > 0 {
-			var err error
-			steerJSON, err = runSteering(steerScript, turnOutput, cfg)
-			if err != nil {
-				fmt.Fprintf(cfg.Stderr, "ralph: steering failed: %v\n", err)
-			} else {
-				fmt.Fprintf(cfg.Stderr, "ralph: steering: %s\n", steerJSON)
-			}
-		}
-
-		// Next turn
-		turn++
-		turnStart = time.Now()
-
-		fmt.Fprintf(cfg.Stderr, "=== turn %d/%d  [%s] ===\n", turn, cfg.MaxIter, time.Now().Format("15:04:05"))
-
-		// Build and send steering message
-		nextMsg := buildSteeringMessage(turn, cfg.MaxIter, steerJSON)
-		if err := tmuxSendText(sessionName, nextMsg); err != nil {
-			fmt.Fprintf(cfg.Stderr, "ralph: failed to send turn %d message: %v\n", turn, err)
-			break
+		if !result.StateWritten {
+			generateFallbackState(i, cfg.StateFile)
 		}
 	}
 
-	// Process exited or context cancelled
 	totalDur := time.Since(loopStart)
-	if ctx.Err() != nil {
-		fmt.Fprintf(cfg.Stderr, "\n=== interrupted ===\n")
-		if ev != nil {
-			ev.Iterations = turn
-		}
-		return 130
-	}
-
-	fmt.Fprintf(cfg.Stderr, "=== session ended at turn %d [%s] ===\n", turn, fmtDuration(totalDur))
+	fmt.Fprintf(cfg.Stderr, "=== stopped at max iterations (%d) [%s] ===\n", cfg.MaxIter, time.Now().Format("15:04:05"))
+	fmt.Fprintf(cfg.Stderr, "=== total time: %s ===\n", fmtDuration(totalDur))
 	if ev != nil {
-		ev.Iterations = turn
+		ev.Iterations = cfg.MaxIter
 	}
 	return 1
 }
 
-// tmuxSendText sends text to a tmux session via send-keys (literal mode).
-// For very long text (>4K), falls back to writing a temp file and using
-// the shell to cat it into the prompt.
-func tmuxSendText(session, text string) error {
-	if len(text) > 4000 {
-		return tmuxSendLongText(session, text)
+// RunIteration runs one claude session and formats output in-process.
+func RunIteration(ctx context.Context, prompt string, maxTurns int, extraEnv []string, w io.Writer) IterResult {
+	start := time.Now()
+
+	args := []string{
+		"-p", prompt,
+		"--allowedTools", "*",
+		"--dangerously-skip-permissions",
+		"--verbose",
+		"--output-format", "stream-json",
 	}
-
-	// send-keys -l sends literal text (no key interpretation)
-	if err := exec.Command("tmux", "send-keys", "-t", session, "-l", text).Run(); err != nil {
-		return fmt.Errorf("send-keys: %w", err)
+	if maxTurns > 0 {
+		args = append(args, "--max-turns", strconv.Itoa(maxTurns))
 	}
-
-	// Small delay to let TUI process
-	time.Sleep(100 * time.Millisecond)
-
-	// Press Enter to submit
-	return exec.Command("tmux", "send-keys", "-t", session, "Enter").Run()
-}
-
-// tmuxSendLongText handles prompts >4K by writing to a temp file and using
-// shell read + paste in the tmux session.
-func tmuxSendLongText(session, text string) error {
-	tmp, err := os.CreateTemp("", "ralph-msg-*.txt")
+	cmd := exec.CommandContext(ctx, "claude", args...)
+	if len(extraEnv) > 0 {
+		cmd.Env = append(os.Environ(), extraEnv...)
+	}
+	// Pipe stderr instead of giving claude the terminal fd directly.
+	// If claude gets a real tty, it sets raw mode and Ctrl+C becomes
+	// byte 0x03 instead of SIGINT — making the process unkillable.
+	stderrPipe, err := cmd.StderrPipe()
 	if err != nil {
-		return err
+		return IterResult{ExitCode: 1, Duration: time.Since(start)}
 	}
-	defer os.Remove(tmp.Name())
-	if _, err := tmp.WriteString(text); err != nil {
-		tmp.Close()
-		return err
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 	}
-	tmp.Close()
+	cmd.WaitDelay = 3 * time.Second
 
-	// Use tmux load-buffer + paste-buffer as fallback for long text.
-	// Claude's TUI handles pasted text the same as typed text.
-	if err := exec.Command("tmux", "load-buffer", "-b", "ralph", tmp.Name()).Run(); err != nil {
-		return fmt.Errorf("load-buffer: %w", err)
-	}
-	if err := exec.Command("tmux", "paste-buffer", "-b", "ralph", "-t", session).Run(); err != nil {
-		return fmt.Errorf("paste-buffer: %w", err)
-	}
-
-	time.Sleep(200 * time.Millisecond)
-	return exec.Command("tmux", "send-keys", "-t", session, "Enter").Run()
-}
-
-// tmuxSessionExists checks if a tmux session is still alive.
-func tmuxSessionExists(session string) bool {
-	return exec.Command("tmux", "has-session", "-t", session).Run() == nil
-}
-
-// waitForClaudeReady polls the tmux pane until Claude shows its UI.
-func waitForClaudeReady(ctx context.Context, session string) bool {
-	deadline := time.After(30 * time.Second)
-	ticker := time.NewTicker(500 * time.Millisecond)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return false
-		case <-deadline:
-			// Timeout — try anyway, Claude might be ready
-			return tmuxSessionExists(session)
-		case <-ticker.C:
-			if !tmuxSessionExists(session) {
-				return false
-			}
-			// Check if Claude's TUI is showing by looking for content in the pane
-			out, err := exec.Command("tmux", "capture-pane", "-t", session, "-p").Output()
-			if err != nil {
-				continue
-			}
-			content := strings.TrimSpace(string(out))
-			// Claude Code shows its UI when ready — any non-empty content means it's up
-			if len(content) > 10 {
-				// Give the TUI a moment to fully render
-				time.Sleep(1 * time.Second)
-				return true
-			}
-		}
-	}
-}
-
-// projectJSONLDir returns the Claude sessions directory for the given cwd.
-func projectJSONLDir(cwd string) string {
-	home, err := os.UserHomeDir()
+	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return ""
-	}
-	// Claude uses cwd with "/" replaced by "-" as the project identifier
-	projectID := strings.ReplaceAll(cwd, "/", "-")
-	return filepath.Join(home, ".claude", "projects", projectID)
-}
-
-// waitForNewJSONL waits for a new .jsonl file to appear in dir (created after 'after').
-func waitForNewJSONL(ctx context.Context, dir string, after time.Time) (string, error) {
-	deadline := time.After(60 * time.Second)
-	ticker := time.NewTicker(1 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return "", ctx.Err()
-		case <-deadline:
-			return "", fmt.Errorf("timeout waiting for session JSONL in %s", dir)
-		case <-ticker.C:
-			entries, err := os.ReadDir(dir)
-			if err != nil {
-				continue
-			}
-			var newest string
-			var newestTime time.Time
-			for _, e := range entries {
-				if e.IsDir() || !strings.HasSuffix(e.Name(), ".jsonl") {
-					continue
-				}
-				info, err := e.Info()
-				if err != nil {
-					continue
-				}
-				if info.ModTime().After(after) && info.ModTime().After(newestTime) {
-					newest = filepath.Join(dir, e.Name())
-					newestTime = info.ModTime()
-				}
-			}
-			if newest != "" {
-				return newest, nil
-			}
-		}
-	}
-}
-
-// waitForTurnComplete waits for Claude to finish its turn using the terminal
-// bell signal. Claude sends a BEL character (\a) when it completes a turn
-// and shows the input prompt. We use tmux's alert-bell hook + wait-for
-// channel to block until the bell fires. No polling, no timeouts.
-//
-// A background goroutine tails the JSONL to capture assistant output
-// for the steerer.
-func waitForTurnComplete(ctx context.Context, session, jsonlPath string) []byte {
-	var turnOutput bytes.Buffer
-
-	// Start JSONL tailer to capture assistant output
-	tailCtx, tailCancel := context.WithCancel(ctx)
-	defer tailCancel()
-	if jsonlPath != "" {
-		go tailJSONLForOutput(tailCtx, jsonlPath, &turnOutput)
+		return IterResult{ExitCode: 1, Duration: time.Since(start)}
 	}
 
-	// Use unique channel name per turn to avoid stale signals
-	channel := fmt.Sprintf("ralph-bell-%s-%d", session, time.Now().UnixNano())
+	if err := cmd.Start(); err != nil {
+		return IterResult{ExitCode: 1, Duration: time.Since(start)}
+	}
 
-	// Set up tmux hook: when bell fires, signal the wait-for channel
-	hookCmd := fmt.Sprintf("run-shell 'tmux wait-for -S %s'", channel)
-	exec.Command("tmux", "set-hook", "-t", session, "alert-bell", hookCmd).Run()
-
-	// Wait for the bell (blocks until Claude finishes)
-	done := make(chan error, 1)
+	// Forward stderr in background
 	go func() {
-		done <- exec.Command("tmux", "wait-for", channel).Run()
+		io.Copy(os.Stderr, stderrPipe)
 	}()
 
-	select {
-	case <-done:
-		// Bell fired — turn complete
-		tailCancel()
-		time.Sleep(300 * time.Millisecond) // let tailer flush
-		return turnOutput.Bytes()
-	case <-ctx.Done():
-		// Interrupted
-		// Unblock the wait-for so the goroutine can exit
-		exec.Command("tmux", "wait-for", "-S", channel).Run()
-		return turnOutput.Bytes()
+	// FormatStream in goroutine so cmd.Wait() isn't blocked behind pipe reads.
+	// Tee output to both the user's terminal and a buffer for steering.
+	var outputBuf bytes.Buffer
+	tee := io.MultiWriter(w, &outputBuf)
+	doneFmt := make(chan struct{})
+	go func() {
+		FormatStream(stdout, tee)
+		close(doneFmt)
+	}()
+
+	waitErr := cmd.Wait()
+	<-doneFmt
+	dur := time.Since(start)
+
+	result := IterResult{Duration: dur, Output: outputBuf.Bytes()}
+
+	if waitErr != nil {
+		if exitErr, ok := waitErr.(*exec.ExitError); ok {
+			result.ExitCode = exitErr.ExitCode()
+		} else {
+			result.ExitCode = 1
+		}
 	}
+
+	if ctx.Err() != nil {
+		result.Interrupted = true
+	}
+
+	if _, err := os.Stat(".ralph-done"); err == nil {
+		result.DoneFile = true
+	}
+	if _, err := os.Stat("ralph-state.md"); err == nil {
+		result.StateWritten = true
+	}
+
+	return result
 }
 
-// tailJSONLForOutput reads new JSONL events and extracts assistant text
-// into the buffer for steering. Runs until context is cancelled.
-func tailJSONLForOutput(ctx context.Context, jsonlPath string, buf *bytes.Buffer) {
-	f, err := os.Open(jsonlPath)
-	if err != nil {
-		return
-	}
-	defer f.Close()
-
-	f.Seek(0, io.SeekEnd)
-	reader := bufio.NewReader(f)
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-
-		line, err := reader.ReadBytes('\n')
-		if err != nil {
-			time.Sleep(300 * time.Millisecond)
-			continue
-		}
-
-		if len(line) == 0 {
-			continue
-		}
-
-		var raw map[string]json.RawMessage
-		if err := json.Unmarshal(line, &raw); err != nil {
-			continue
-		}
-
-		if jsonString(raw, "type") == "assistant" {
-			extractAssistantText(raw, buf)
-		}
-	}
-}
-
-// waitForTurnCompleteByPoll is the fallback when JSONL is unavailable.
-// Polls for .ralph-done or session death.
-func waitForTurnCompleteByPoll(ctx context.Context, session string) []byte {
-	// Without JSONL, we can't detect turn completion precisely.
-	// Poll for session death or .ralph-done as signals.
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-ticker.C:
-			if !tmuxSessionExists(session) {
-				return nil
-			}
-			if _, err := os.Stat(".ralph-done"); err == nil {
-				return nil
-			}
-		}
-	}
-}
-
-// extractAssistantText pulls text and tool info from an assistant event into the buffer.
-func extractAssistantText(raw map[string]json.RawMessage, buf *bytes.Buffer) {
-	msgRaw, ok := raw["message"]
-	if !ok {
-		return
-	}
-
-	var msg struct {
-		Content []struct {
-			Type  string          `json:"type"`
-			Text  string          `json:"text"`
-			Name  string          `json:"name"`
-			Input json.RawMessage `json:"input"`
-		} `json:"content"`
-	}
-	if err := json.Unmarshal(msgRaw, &msg); err != nil {
-		return
-	}
-
-	for _, block := range msg.Content {
-		switch block.Type {
-		case "text":
-			if block.Text != "" {
-				fmt.Fprintln(buf, block.Text)
-			}
-		case "tool_use":
-			detail := extractToolDetail(block.Name, block.Input)
-			if detail != "" {
-				fmt.Fprintf(buf, "▶ %s  %s\n", block.Name, detail)
-			} else {
-				fmt.Fprintf(buf, "▶ %s\n", block.Name)
-			}
-		}
-	}
-}
-
-// buildInitialPrompt assembles the first turn's prompt with preamble + user task.
-func buildInitialPrompt(cfg RalphConfig) string {
+func buildPrompt(iter, max int, stateFile, promptFile, promptText string, stallCount int, planMode bool, steerOutput string) string {
 	var b strings.Builder
 
-	b.WriteString(readPreamble(1, cfg.MaxIter, cfg.StateFile, cfg.PlanMode))
+	// preamble (read from disk each iteration — editable without rebuild)
+	b.WriteString(readPreamble(iter, max, stateFile, planMode))
 	b.WriteString("\n")
 
-	if cfg.PromptFile != "" {
-		content, err := os.ReadFile(cfg.PromptFile)
+	// Steering signal (replaces stall warning when active)
+	if steerOutput != "" {
+		b.WriteString("### Steering Signal\n\n")
+		for _, field := range []string{"status", "action", "reason", "directive"} {
+			if val := jsonField(steerOutput, field); val != "" {
+				label := strings.ToUpper(field[:1]) + field[1:]
+				b.WriteString("**" + label + ":** " + val + "\n")
+			}
+		}
+		b.WriteString("\nRaw: `" + steerOutput + "`\n\n---\n\n")
+	} else if stallCount >= 3 {
+		// Fallback stall warning when no steering is available
+		fmt.Fprintf(&b, `
+### STALL DETECTED — %d consecutive iterations with zero commits
+
+Previous iterations explored the codebase but changed nothing. You MUST either:
+1. **Create .ralph-done** if all work is complete (including if remaining items are BLOCKED)
+2. **Make a concrete code change and commit it** — not audit, not explore, not review
+
+If the TODO is empty and BLOCKED items require user action, create .ralph-done NOW.
+Do NOT re-audit. Do NOT start a server. Do NOT take screenshots.
+
+---
+
+`, stallCount)
+	}
+
+	// user prompt (file + optional inline text)
+	if promptFile != "" {
+		content, err := os.ReadFile(promptFile)
 		if err != nil {
 			fmt.Fprintf(&b, "[ERROR: could not read prompt file: %s]\n", err)
 		} else {
 			b.Write(content)
 		}
 	}
-	if cfg.PromptText != "" {
-		if cfg.PromptFile != "" {
+	if promptText != "" {
+		if promptFile != "" {
 			b.WriteString("\n\n---\n\n## Additional Instructions\n\n")
 		}
-		b.WriteString(cfg.PromptText)
+		b.WriteString(promptText)
 	}
 
-	// Append state file if it exists from a previous run
-	if state, err := os.ReadFile(cfg.StateFile); err == nil {
+	// state file appended last (recency bias)
+	if state, err := os.ReadFile(stateFile); err == nil {
 		b.WriteString("\n\n---\n\n")
-		b.WriteString("## CURRENT STATE — READ THIS FIRST (from previous run)\n\n")
+		b.WriteString("## CURRENT STATE — READ THIS FIRST (from previous iterations)\n\n")
+		b.WriteString("**This is your memory. Act on this, not on re-auditing the codebase.**\n\n")
 		b.Write(state)
 	}
 
 	return b.String()
-}
-
-// buildSteeringMessage creates the follow-up message sent between turns.
-func buildSteeringMessage(turn, maxTurn int, steerJSON string) string {
-	var b strings.Builder
-
-	fmt.Fprintf(&b, "Turn %d of %d. ", turn, maxTurn)
-
-	if steerJSON != "" {
-		status := jsonField(steerJSON, "status")
-		action := jsonField(steerJSON, "action")
-		directive := jsonField(steerJSON, "directive")
-		reason := jsonField(steerJSON, "reason")
-
-		switch status {
-		case "done":
-			b.WriteString("Work appears complete. Verify build passes and git is clean, then create .ralph-done.")
-		case "wrong":
-			fmt.Fprintf(&b, "WARNING: %s. Action: %s. %s", reason, action, directive)
-		case "stalled":
-			fmt.Fprintf(&b, "You appear stalled: %s. %s", reason, directive)
-		default:
-			if directive != "" {
-				b.WriteString(directive)
-			} else {
-				b.WriteString("Continue working.")
-			}
-		}
-	} else {
-		b.WriteString("Continue working on the task.")
-	}
-
-	return b.String()
-}
-
-func printTurnSummary(w io.Writer, turn int, turnDur, totalDur time.Duration) {
-	fmt.Fprintln(w)
-	fmt.Fprintf(w, "--- turn %d summary ---\n", turn)
-	fmt.Fprintf(w, "  duration: %s  (total: %s)\n", fmtDuration(turnDur), fmtDuration(totalDur))
-
-	if out, err := exec.Command("git", "log", "--oneline", "-1").Output(); err == nil {
-		fmt.Fprintf(w, "  last commit: %s", string(out))
-	}
-
-	fmt.Fprintln(w, "---")
-	fmt.Fprintln(w)
 }
 
 // resolveSteerScript finds a steering script via convention or explicit path.
@@ -811,8 +530,8 @@ func resolveSteerScript(configured string) string {
 }
 
 // runSteering executes the steering script, feeding it the original task,
-// last turn's output, and state file via stdin.
-func runSteering(script string, turnOutput []byte, cfg RalphConfig) (string, error) {
+// last iteration's output, and state file via stdin.
+func runSteering(script string, iterOutput []byte, cfg RalphConfig) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "bash", script, "-")
@@ -830,8 +549,8 @@ func runSteering(script string, turnOutput []byte, cfg RalphConfig) (string, err
 		stdin.WriteString(cfg.PromptText)
 	}
 
-	stdin.WriteString("\n\n---\n\n## Agent Output (last turn)\n\n")
-	stdin.Write(turnOutput)
+	stdin.WriteString("\n\n---\n\n## Agent Output (last iteration)\n\n")
+	stdin.Write(iterOutput)
 	if state, err := os.ReadFile(cfg.StateFile); err == nil {
 		stdin.WriteString("\n\n---\n\n## State File (ralph-state.md)\n\n")
 		stdin.Write(state)
@@ -860,10 +579,6 @@ func jsonField(j, key string) string {
 	return j[start : start+end]
 }
 
-func shellQuote(s string) string {
-	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
-}
-
 func gitHead() string {
 	out, err := exec.Command("git", "rev-parse", "HEAD").Output()
 	if err != nil {
@@ -875,6 +590,70 @@ func gitHead() string {
 func killStaleServers() {
 	exec.Command("pkill", "-f", "next dev").Run()
 	exec.Command("pkill", "-f", "vite.*--port").Run()
+}
+
+func generateFallbackState(iter int, stateFile string) {
+	var b strings.Builder
+	fmt.Fprintf(&b, "# Ralph State (auto-generated — iteration %d did not write state)\n\n", iter)
+
+	b.WriteString("## DONE\n")
+	out, err := exec.Command("git", "log", "--oneline", "HEAD~5..HEAD").Output()
+	if err == nil && len(out) > 0 {
+		for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+			fmt.Fprintf(&b, "- %s\n", line)
+		}
+	} else {
+		b.WriteString("- (no recent commits)\n")
+	}
+
+	b.WriteString("\n## TODO\n")
+	b.WriteString("- Check git log and git diff for what's unfinished\n")
+	b.WriteString("- If all work is complete, create .ralph-done immediately\n")
+
+	b.WriteString("\n## BLOCKED\n")
+	b.WriteString("- none known\n")
+
+	b.WriteString("\n## NOTES\n")
+	b.WriteString("- Previous iteration did not write state. Check git diff for uncommitted work.\n")
+	if out, err := exec.Command("git", "diff", "--stat", "HEAD").Output(); err == nil {
+		if last := lastLine(strings.TrimSpace(string(out))); last != "" {
+			fmt.Fprintf(&b, "- Uncommitted changes: %s\n", last)
+		}
+	}
+
+	b.WriteString("\n## LEARNINGS (append-only — NEVER delete or edit previous entries)\n")
+	fmt.Fprintf(&b, "- iter %d: agent failed to write state file — likely ran out of context on audit loop\n", iter)
+
+	os.WriteFile(stateFile, []byte(b.String()), 0644)
+}
+
+func printIterSummary(w io.Writer, iter int, result IterResult, totalDur time.Duration) {
+	fmt.Fprintln(w)
+	fmt.Fprintf(w, "--- iteration %d summary ---\n", iter)
+	fmt.Fprintf(w, "  duration: %s  (total: %s)\n", fmtDuration(result.Duration), fmtDuration(totalDur))
+
+	if out, err := exec.Command("git", "diff", "--stat", "HEAD").Output(); err == nil {
+		if last := lastLine(strings.TrimSpace(string(out))); last != "" {
+			fmt.Fprintf(w, "  unstaged: %s\n", last)
+		}
+	}
+	if out, err := exec.Command("git", "diff", "--cached", "--stat").Output(); err == nil {
+		if last := lastLine(strings.TrimSpace(string(out))); last != "" {
+			fmt.Fprintf(w, "  staged:   %s\n", last)
+		}
+	}
+	if out, err := exec.Command("git", "log", "--oneline", "-1").Output(); err == nil {
+		fmt.Fprintf(w, "  last commit: %s", string(out))
+	}
+
+	stateExists := "no"
+	if _, err := os.Stat("ralph-state.md"); err == nil {
+		stateExists = "yes"
+	}
+	fmt.Fprintf(w, "  state file:  %s\n", stateExists)
+
+	fmt.Fprintln(w, "---")
+	fmt.Fprintln(w)
 }
 
 func fmtDuration(d time.Duration) string {
