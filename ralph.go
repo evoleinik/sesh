@@ -280,7 +280,7 @@ func Ralph(cfg RalphConfig, ev *Event) int {
 		fmt.Fprintf(cfg.Stderr, "ralph: steering=%s\n", steerScript)
 	}
 
-	fmt.Fprintf(cfg.Stderr, "ralph: prompt=%s max=%d mode=%s cwd=%s\n", label, cfg.MaxIter, mode, cwd)
+	fmt.Fprintf(cfg.Stderr, "ralph: prompt=%s max=%d turns=%d mode=%s cwd=%s\n", label, cfg.MaxIter, cfg.MaxTurns, mode, cwd)
 	fmt.Fprintf(cfg.Stderr, "ralph: started at %s\n\n", time.Now().Format("2006-01-02 15:04:05"))
 
 	lastHead := gitHead()

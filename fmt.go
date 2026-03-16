@@ -102,11 +102,7 @@ func extractToolDetail(name string, input json.RawMessage) string {
 
 	switch name {
 	case "Bash":
-		cmd := jsonString(inp, "command")
-		if len(cmd) > 80 {
-			cmd = cmd[:80]
-		}
-		return cmd
+		return jsonString(inp, "command")
 	case "Read", "Edit", "Write":
 		return jsonString(inp, "file_path")
 	case "Grep":
