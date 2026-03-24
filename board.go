@@ -18,20 +18,28 @@ type TasksFile struct {
 }
 
 type Task struct {
-	Num         int         `json:"num"`
-	ID          string      `json:"id"`
-	Title       string      `json:"title"`
-	Description string      `json:"description,omitempty"`
-	Stage       string      `json:"stage"`
-	Prompt      string      `json:"prompt,omitempty"`
-	Spawn       string      `json:"spawn,omitempty"`
-	Worktree    string      `json:"worktree,omitempty"`
-	Branch      string      `json:"branch,omitempty"`
-	PR          int         `json:"pr,omitempty"`
-	Review      *TaskReview `json:"review,omitempty"`
-	Merged      string      `json:"merged,omitempty"`
-	Created     string      `json:"created"`
-	Updated     string      `json:"updated,omitempty"`
+	Num         int            `json:"num"`
+	ID          string         `json:"id"`
+	Title       string         `json:"title"`
+	Description string         `json:"description,omitempty"`
+	Stage       string         `json:"stage"`
+	Prompt      string         `json:"prompt,omitempty"`
+	Spawn       string         `json:"spawn,omitempty"`
+	Worktree    string         `json:"worktree,omitempty"`
+	Branch      string         `json:"branch,omitempty"`
+	PR          int            `json:"pr,omitempty"`
+	Iterations  int            `json:"iterations,omitempty"`
+	Review      *TaskReview    `json:"review,omitempty"`
+	Merged      string         `json:"merged,omitempty"`
+	Created     string         `json:"created"`
+	Updated     string         `json:"updated,omitempty"`
+	History     []StageChange  `json:"history,omitempty"`
+}
+
+type StageChange struct {
+	Stage string `json:"stage"`
+	At    string `json:"at"`
+	Note  string `json:"note,omitempty"`
 }
 
 type TaskReview struct {
@@ -41,14 +49,21 @@ type TaskReview struct {
 }
 
 var boardUsage = `Usage: sesh board [flags]
-  Show the task board.
+  Task board with deterministic pipeline.
 
-  --watch       Poll every 30s and re-render
-  --react       Enable reactions (spawn fixers on CI fail / review)
-  --json        Output raw tasks.json
-  --add TITLE   Add a new task to scope
-  --move ID STAGE  Move a task to a stage
-  --file PATH   Tasks file (default: auto-detect)`
+  sesh board                 Show the board
+  sesh board --add TITLE     Add a new task to scope
+  sesh board --advance ID    Move task to next stage (checks preconditions)
+  sesh board --fix ID        Spawn fixer for review issues
+  sesh board --merge ID      Merge PR and clean up (from deploy stage)
+  sesh board --move ID STAGE Force-move (escape hatch, no preconditions)
+  sesh board --watch         Poll every 30s and re-render
+  sesh board --react         Watch + auto-advance when preconditions met
+  sesh board --json          Output raw tasks.json
+  sesh board --file PATH     Use specific tasks file
+
+  Pipeline: scope → develop → code_review → deploy → done
+  Tasks are referenced by number (#7) or ID (tuco-qa).`
 
 func runBoard(args []string) int {
 	watch := false
@@ -58,6 +73,9 @@ func runBoard(args []string) int {
 	addTitle := ""
 	moveID := ""
 	moveStage := ""
+	advanceID := ""
+	fixID := ""
+	mergeID := ""
 
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
@@ -65,7 +83,7 @@ func runBoard(args []string) int {
 			watch = true
 		case "--react":
 			react = true
-			watch = true // react implies watch
+			watch = true
 		case "--json":
 			jsonOutput = true
 		case "--file":
@@ -87,6 +105,30 @@ func runBoard(args []string) int {
 				fmt.Fprintln(os.Stderr, "sesh board --move requires ID and STAGE")
 				return 1
 			}
+		case "--advance":
+			i++
+			if i < len(args) {
+				advanceID = args[i]
+			} else {
+				fmt.Fprintln(os.Stderr, "sesh board --advance requires task ID or number")
+				return 1
+			}
+		case "--fix":
+			i++
+			if i < len(args) {
+				fixID = args[i]
+			} else {
+				fmt.Fprintln(os.Stderr, "sesh board --fix requires task ID or number")
+				return 1
+			}
+		case "--merge":
+			i++
+			if i < len(args) {
+				mergeID = args[i]
+			} else {
+				fmt.Fprintln(os.Stderr, "sesh board --merge requires task ID or number")
+				return 1
+			}
 		case "--help", "-h":
 			fmt.Println(boardUsage)
 			return 0
@@ -106,9 +148,24 @@ func runBoard(args []string) int {
 		return boardAdd(tasksFile, addTitle)
 	}
 
-	// Move task
+	// Move task (escape hatch, no preconditions)
 	if moveID != "" {
 		return boardMove(tasksFile, moveID, moveStage)
+	}
+
+	// Advance task (with preconditions)
+	if advanceID != "" {
+		return boardAdvance(tasksFile, advanceID)
+	}
+
+	// Fix review issues
+	if fixID != "" {
+		return boardFix(tasksFile, fixID)
+	}
+
+	// Merge and clean up
+	if mergeID != "" {
+		return boardMerge(tasksFile, mergeID)
 	}
 
 	// JSON output
@@ -162,6 +219,32 @@ func findTasksFile() string {
 	}
 
 	return ""
+}
+
+// findTask returns a pointer to the task matching id (string) or num (int)
+func findTask(tf *TasksFile, ref string) *Task {
+	num := 0
+	fmt.Sscanf(ref, "%d", &num)
+	for i := range tf.Tasks {
+		if tf.Tasks[i].ID == ref || (num > 0 && tf.Tasks[i].Num == num) {
+			return &tf.Tasks[i]
+		}
+	}
+	return nil
+}
+
+// transition moves a task to a new stage with history tracking
+func transition(t *Task, stage, note string) {
+	t.Stage = stage
+	t.Updated = time.Now().Format(time.RFC3339)
+	t.History = append(t.History, StageChange{
+		Stage: stage,
+		At:    time.Now().Format(time.RFC3339),
+		Note:  note,
+	})
+	if stage == "done" {
+		t.Merged = time.Now().Format("2006-01-02")
+	}
 }
 
 func loadTasks(path string) (*TasksFile, error) {
@@ -317,34 +400,315 @@ func boardMove(tasksFile, id, stage string) int {
 		return 1
 	}
 
-	found := false
-	num := 0
-	fmt.Sscanf(id, "%d", &num)
-
-	for i := range tf.Tasks {
-		if tf.Tasks[i].ID == id || (num > 0 && tf.Tasks[i].Num == num) {
-			tf.Tasks[i].Stage = stage
-			tf.Tasks[i].Updated = time.Now().Format(time.RFC3339)
-			if stage == "done" {
-				tf.Tasks[i].Merged = time.Now().Format("2006-01-02")
-			}
-			found = true
-			id = tf.Tasks[i].ID // for the success message
-			break
-		}
-	}
-
-	if !found {
+	t := findTask(tf, id)
+	if t == nil {
 		fmt.Fprintf(os.Stderr, "sesh board: task %q not found\n", id)
 		return 1
 	}
+
+	transition(t, stage, "force-move")
 
 	if err := saveTasks(tasksFile, tf); err != nil {
 		fmt.Fprintf(os.Stderr, "sesh board: %v\n", err)
 		return 1
 	}
 
-	fmt.Printf("Moved: %s → %s\n", id, stage)
+	fmt.Printf("Moved: #%d %s → %s\n", t.Num, t.ID, stage)
+	return 0
+}
+
+// boardAdvance moves a task to the next stage, checking preconditions.
+func boardAdvance(tasksFile, ref string) int {
+	tf, err := loadTasks(tasksFile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "sesh board: %v\n", err)
+		return 1
+	}
+
+	t := findTask(tf, ref)
+	if t == nil {
+		fmt.Fprintf(os.Stderr, "sesh board: task %q not found\n", ref)
+		return 1
+	}
+
+	switch t.Stage {
+	case "scope":
+		return advanceScopeToDevelop(tasksFile, tf, t)
+	case "develop":
+		return advanceDevelopToCodeReview(tasksFile, tf, t)
+	case "code_review":
+		return advanceCodeReviewToDeploy(tasksFile, tf, t)
+	case "deploy":
+		fmt.Fprintf(os.Stderr, "Cannot advance from deploy — use `sesh board --merge %d`\n", t.Num)
+		return 1
+	case "done":
+		fmt.Fprintln(os.Stderr, "Task is already done")
+		return 1
+	default:
+		fmt.Fprintf(os.Stderr, "Unknown stage: %s\n", t.Stage)
+		return 1
+	}
+}
+
+func advanceScopeToDevelop(tasksFile string, tf *TasksFile, t *Task) int {
+	// Precondition: prompt file must exist
+	if t.Prompt == "" {
+		fmt.Fprintf(os.Stderr, "✗ Cannot advance #%d: no prompt file set\n", t.Num)
+		fmt.Fprintln(os.Stderr, "  Set it: write a prompt to prompts/{name}.md and update the task")
+		return 1
+	}
+
+	// Check prompt file exists (in project root)
+	root, _ := findGitRoot()
+	promptPath := filepath.Join(root, t.Prompt)
+	if _, err := os.Stat(promptPath); os.IsNotExist(err) {
+		fmt.Fprintf(os.Stderr, "✗ Cannot advance #%d: prompt file %s not found\n", t.Num, t.Prompt)
+		return 1
+	}
+
+	// Spawn the worker
+	if t.Spawn == "" {
+		t.Spawn = t.ID
+	}
+	if t.Branch == "" {
+		t.Branch = "feat/" + t.ID
+	}
+	iterations := t.Iterations
+	if iterations == 0 {
+		iterations = 15
+	}
+
+	repoName := filepath.Base(root)
+	t.Worktree = repoName + "-" + t.Spawn
+
+	fmt.Fprintf(os.Stderr, "Spawning #%d %s...\n", t.Num, t.Title)
+	spawnArgs := []string{"-n", t.Spawn, t.Prompt, fmt.Sprintf("%d", iterations)}
+	code := runSpawn(spawnArgs)
+	if code != 0 {
+		fmt.Fprintf(os.Stderr, "✗ Spawn failed for #%d\n", t.Num)
+		return code
+	}
+
+	transition(t, "develop", "spawned worker")
+	saveTasks(tasksFile, tf)
+	fmt.Printf("✓ #%d advanced: scope → develop (worker spawned)\n", t.Num)
+	return 0
+}
+
+func advanceDevelopToCodeReview(tasksFile string, tf *TasksFile, t *Task) int {
+	root, _ := findGitRoot()
+	repoName := filepath.Base(root)
+	worktreePath := filepath.Join(filepath.Dir(root), repoName+"-"+t.Spawn)
+
+	// Precondition: .ralph-done must exist
+	doneFile := filepath.Join(worktreePath, ".ralph-done")
+	if _, err := os.Stat(doneFile); os.IsNotExist(err) {
+		fmt.Fprintf(os.Stderr, "✗ Cannot advance #%d: worker not finished (.ralph-done missing)\n", t.Num)
+		fmt.Fprintf(os.Stderr, "  Check: sesh spawn --check %s\n", t.Spawn)
+		return 1
+	}
+
+	// Find or create PR
+	if t.PR == 0 {
+		branch := t.Branch
+		if branch == "" {
+			branch = "feat/" + t.ID
+		}
+		// Check if PR exists
+		out, err := exec.Command("gh", "pr", "list", "--head", branch, "--json", "number", "--jq", ".[0].number").Output()
+		if err == nil {
+			num := 0
+			fmt.Sscanf(strings.TrimSpace(string(out)), "%d", &num)
+			if num > 0 {
+				t.PR = num
+			}
+		}
+
+		// Create PR if none
+		if t.PR == 0 {
+			fmt.Fprintf(os.Stderr, "Creating PR for #%d...\n", t.Num)
+			out, err := exec.Command("gh", "pr", "create",
+				"--head", branch,
+				"--title", fmt.Sprintf("#%d %s", t.Num, t.Title),
+				"--body", fmt.Sprintf("Task #%d from sesh board.\n\n🤖 Generated with sesh", t.Num),
+			).Output()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "✗ Cannot create PR: %v\n%s\n", err, string(out))
+				return 1
+			}
+			// Parse PR URL to get number
+			prURL := strings.TrimSpace(string(out))
+			parts := strings.Split(prURL, "/")
+			if len(parts) > 0 {
+				fmt.Sscanf(parts[len(parts)-1], "%d", &t.PR)
+			}
+			fmt.Fprintf(os.Stderr, "Created PR #%d\n", t.PR)
+		}
+	}
+
+	transition(t, "code_review", fmt.Sprintf("PR #%d", t.PR))
+	saveTasks(tasksFile, tf)
+	fmt.Printf("✓ #%d advanced: develop → code_review [PR #%d]\n", t.Num, t.PR)
+	return 0
+}
+
+func advanceCodeReviewToDeploy(tasksFile string, tf *TasksFile, t *Task) int {
+	if t.PR == 0 {
+		fmt.Fprintf(os.Stderr, "✗ Cannot advance #%d: no PR associated\n", t.Num)
+		return 1
+	}
+
+	// Check CI status
+	out, err := exec.Command("gh", "pr", "checks", fmt.Sprintf("%d", t.PR), "--json", "name,conclusion").Output()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "✗ Cannot check CI for PR #%d: %v\n", t.PR, err)
+		return 1
+	}
+
+	checksJSON := string(out)
+	if strings.Contains(checksJSON, "FAILURE") || strings.Contains(checksJSON, "TIMED_OUT") {
+		fmt.Fprintf(os.Stderr, "✗ Cannot advance #%d: CI is failing on PR #%d\n", t.Num, t.PR)
+		fmt.Fprintf(os.Stderr, "  Fix with: sesh board --fix %d\n", t.Num)
+		return 1
+	}
+
+	// Check review decision
+	out, err = exec.Command("gh", "pr", "view", fmt.Sprintf("%d", t.PR), "--json", "reviewDecision", "--jq", ".reviewDecision").Output()
+	if err == nil {
+		decision := strings.TrimSpace(string(out))
+		if decision == "CHANGES_REQUESTED" {
+			fmt.Fprintf(os.Stderr, "✗ Cannot advance #%d: review requested changes on PR #%d\n", t.Num, t.PR)
+			fmt.Fprintf(os.Stderr, "  Fix with: sesh board --fix %d\n", t.Num)
+			return 1
+		}
+	}
+
+	transition(t, "deploy", "CI green, review clean")
+	saveTasks(tasksFile, tf)
+	fmt.Printf("✓ #%d advanced: code_review → deploy [PR #%d ready to merge]\n", t.Num, t.PR)
+	return 0
+}
+
+// boardFix reads review comments and spawns a fixer worker
+func boardFix(tasksFile, ref string) int {
+	tf, err := loadTasks(tasksFile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "sesh board: %v\n", err)
+		return 1
+	}
+
+	t := findTask(tf, ref)
+	if t == nil {
+		fmt.Fprintf(os.Stderr, "sesh board: task %q not found\n", ref)
+		return 1
+	}
+
+	if t.Stage != "code_review" && t.Stage != "develop" {
+		fmt.Fprintf(os.Stderr, "✗ Cannot fix #%d: task is in %s, not code_review\n", t.Num, t.Stage)
+		return 1
+	}
+
+	if t.PR == 0 {
+		fmt.Fprintf(os.Stderr, "✗ Cannot fix #%d: no PR associated\n", t.Num)
+		return 1
+	}
+
+	// Read review comments
+	out, err := exec.Command("gh", "pr", "view", fmt.Sprintf("%d", t.PR), "--json", "comments", "--jq", "[.comments[].body] | join(\"\\n---\\n\")").Output()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "✗ Cannot read PR #%d comments: %v\n", t.PR, err)
+		return 1
+	}
+
+	comments := strings.TrimSpace(string(out))
+	if comments == "" {
+		fmt.Fprintf(os.Stderr, "✗ No review comments on PR #%d — nothing to fix\n", t.PR)
+		return 1
+	}
+
+	// Generate fix prompt
+	root, _ := findGitRoot()
+	fixPromptPath := filepath.Join(root, "prompts", t.ID+"-fix.md")
+
+	fixPrompt := fmt.Sprintf(`# Fix review issues for #%d %s
+
+## Context
+PR #%d received review comments. Fix the issues below.
+
+Working directory: the worktree for this task.
+Branch: %s
+
+## Review Comments
+
+%s
+
+## Rules
+- Read each file BEFORE editing
+- Run npm run build after fixes
+- Run npm test after fixes
+- Commit each fix separately
+- Push to the same branch
+`, t.Num, t.Title, t.PR, t.Branch, comments)
+
+	os.MkdirAll(filepath.Dir(fixPromptPath), 0755)
+	os.WriteFile(fixPromptPath, []byte(fixPrompt), 0644)
+
+	// Spawn fixer in same worktree
+	fmt.Fprintf(os.Stderr, "Spawning fixer for #%d (PR #%d)...\n", t.Num, t.PR)
+	spawnArgs := []string{"-n", t.Spawn, fixPromptPath, "5"}
+	code := runSpawn(spawnArgs)
+	if code != 0 {
+		fmt.Fprintf(os.Stderr, "✗ Spawn fixer failed for #%d\n", t.Num)
+		return code
+	}
+
+	transition(t, "develop", "fix spawned for review issues")
+	saveTasks(tasksFile, tf)
+	fmt.Printf("✓ #%d fix spawned: code_review → develop\n", t.Num)
+	return 0
+}
+
+// boardMerge merges a PR and cleans up
+func boardMerge(tasksFile, ref string) int {
+	tf, err := loadTasks(tasksFile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "sesh board: %v\n", err)
+		return 1
+	}
+
+	t := findTask(tf, ref)
+	if t == nil {
+		fmt.Fprintf(os.Stderr, "sesh board: task %q not found\n", ref)
+		return 1
+	}
+
+	if t.Stage != "deploy" {
+		fmt.Fprintf(os.Stderr, "✗ Cannot merge #%d: task is in %s, not deploy\n", t.Num, t.Stage)
+		fmt.Fprintln(os.Stderr, "  Advance to deploy first: sesh board --advance", ref)
+		return 1
+	}
+
+	if t.PR == 0 {
+		fmt.Fprintf(os.Stderr, "✗ Cannot merge #%d: no PR associated\n", t.Num)
+		return 1
+	}
+
+	// Merge the PR
+	fmt.Fprintf(os.Stderr, "Merging PR #%d...\n", t.PR)
+	out, err := exec.Command("gh", "pr", "merge", fmt.Sprintf("%d", t.PR), "--squash", "--delete-branch").CombinedOutput()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "✗ Merge failed: %v\n%s\n", err, string(out))
+		return 1
+	}
+
+	// Clean up worktree
+	if t.Spawn != "" {
+		spawnKill(t.Spawn)
+	}
+
+	transition(t, "done", fmt.Sprintf("merged PR #%d", t.PR))
+	saveTasks(tasksFile, tf)
+	fmt.Printf("✓ #%d merged and cleaned up\n", t.Num)
 	return 0
 }
 
