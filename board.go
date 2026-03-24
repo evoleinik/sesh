@@ -23,6 +23,7 @@ type Task struct {
 	Title       string         `json:"title"`
 	Description string         `json:"description,omitempty"`
 	Priority    string         `json:"priority,omitempty"` // p0, p1, p2 (empty = p2)
+	BlockedBy   []int          `json:"blockedBy,omitempty"`
 	Stage       string         `json:"stage"`
 	Prompt      string         `json:"prompt,omitempty"`
 	Spawn       string         `json:"spawn,omitempty"`
@@ -57,6 +58,8 @@ var boardUsage = `Usage: sesh board [flags]
   sesh board --advance ID    Move task to next stage (checks preconditions)
   sesh board --fix ID        Spawn fixer for review issues
   sesh board --merge ID      Merge PR and clean up (from deploy stage)
+  sesh board --set ID F V    Set a task field (prompt, desc, branch, blocked-by, unblock)
+  sesh board --priority ID L Set priority (p0/p1/p2)
   sesh board --move ID STAGE Force-move (escape hatch, no preconditions)
   sesh board --watch         Poll every 30s and re-render
   sesh board --react         Watch + auto-advance when preconditions met
@@ -64,7 +67,8 @@ var boardUsage = `Usage: sesh board [flags]
   sesh board --file PATH     Use specific tasks file
 
   Pipeline: scope → develop → code_review → deploy → done
-  Tasks are referenced by number (#7) or ID (tuco-qa).`
+  Tasks are referenced by number (#7) or ID (tuco-qa).
+  Tasks can be blocked: --set 7 blocked-by 6 (unblock: --set 7 unblock 6)`
 
 func runBoard(args []string) int {
 	watch := false
@@ -79,6 +83,9 @@ func runBoard(args []string) int {
 	mergeID := ""
 	prioID := ""
 	prioLevel := ""
+	setID := ""
+	setField := ""
+	setValue := ""
 
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
@@ -141,6 +148,16 @@ func runBoard(args []string) int {
 				fmt.Fprintln(os.Stderr, "sesh board --priority requires ID and LEVEL (p0/p1/p2)")
 				return 1
 			}
+		case "--set":
+			if i+3 < len(args) {
+				setID = args[i+1]
+				setField = args[i+2]
+				setValue = args[i+3]
+				i += 3
+			} else {
+				fmt.Fprintln(os.Stderr, "sesh board --set requires ID FIELD VALUE")
+				return 1
+			}
 		case "--help", "-h":
 			fmt.Println(boardUsage)
 			return 0
@@ -153,6 +170,11 @@ func runBoard(args []string) int {
 	if tasksFile == "" {
 		fmt.Fprintln(os.Stderr, "sesh board: no tasks.json found")
 		return 1
+	}
+
+	// Set task field
+	if setID != "" {
+		return boardSet(tasksFile, setID, setField, setValue)
 	}
 
 	// Add task
@@ -370,6 +392,11 @@ func boardRender(tasksFile string) int {
 					line += fmt.Sprintf(" [PR #%d]", t.PR)
 				}
 
+				// Blocked status
+				if blocked, blockers := isBlocked(&t, tf); blocked {
+					line += fmt.Sprintf(" 🔒 blocked by %s", blockers)
+				}
+
 				// Live status for develop tasks
 				if t.Stage == "develop" && t.Spawn != "" {
 					wtPath := filepath.Join(filepath.Dir(root), repoName+"-"+t.Spawn)
@@ -510,6 +537,66 @@ func boardMove(tasksFile, id, stage string) int {
 }
 
 // boardAdvance moves a task to the next stage, checking preconditions.
+func boardSet(tasksFile, ref, field, value string) int {
+	tf, err := loadTasks(tasksFile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "sesh board: %v\n", err)
+		return 1
+	}
+
+	t := findTask(tf, ref)
+	if t == nil {
+		fmt.Fprintf(os.Stderr, "sesh board: task %q not found\n", ref)
+		return 1
+	}
+
+	switch field {
+	case "prompt":
+		t.Prompt = value
+	case "description", "desc":
+		t.Description = value
+	case "branch":
+		t.Branch = value
+	case "spawn":
+		t.Spawn = value
+	case "iterations":
+		fmt.Sscanf(value, "%d", &t.Iterations)
+	case "pr":
+		fmt.Sscanf(value, "%d", &t.PR)
+	case "blocked-by", "blockedBy":
+		num := 0
+		fmt.Sscanf(value, "%d", &num)
+		if num > 0 {
+			// Add if not already present
+			for _, b := range t.BlockedBy {
+				if b == num {
+					fmt.Printf("#%d already blocked by #%d\n", t.Num, num)
+					return 0
+				}
+			}
+			t.BlockedBy = append(t.BlockedBy, num)
+		}
+	case "unblock":
+		num := 0
+		fmt.Sscanf(value, "%d", &num)
+		newBlocked := []int{}
+		for _, b := range t.BlockedBy {
+			if b != num {
+				newBlocked = append(newBlocked, b)
+			}
+		}
+		t.BlockedBy = newBlocked
+	default:
+		fmt.Fprintf(os.Stderr, "sesh board: unknown field %q (prompt/description/branch/spawn/iterations/pr/blocked-by/unblock)\n", field)
+		return 1
+	}
+
+	t.Updated = time.Now().Format(time.RFC3339)
+	saveTasks(tasksFile, tf)
+	fmt.Printf("#%d %s = %s\n", t.Num, field, value)
+	return 0
+}
+
 func boardPriority(tasksFile, ref, level string) int {
 	valid := map[string]bool{"p0": true, "p1": true, "p2": true}
 	if !valid[level] {
@@ -569,11 +656,26 @@ func boardAdvance(tasksFile, ref string) int {
 }
 
 func advanceScopeToDevelop(tasksFile string, tf *TasksFile, t *Task) int {
-	// Precondition: prompt file must exist
-	if t.Prompt == "" {
-		fmt.Fprintf(os.Stderr, "✗ Cannot advance #%d: no prompt file set\n", t.Num)
-		fmt.Fprintln(os.Stderr, "  Set it: write a prompt to prompts/{name}.md and update the task")
+	// Precondition: not blocked
+	if blocked, blockers := isBlocked(t, tf); blocked {
+		fmt.Fprintf(os.Stderr, "✗ Cannot advance #%d: blocked by %s\n", t.Num, blockers)
 		return 1
+	}
+
+	// Precondition: prompt file must exist (auto-detect if not set)
+	if t.Prompt == "" {
+		// Auto-detect: check prompts/{id}.md
+		root, _ := findGitRoot()
+		autoPrompt := "prompts/" + t.ID + ".md"
+		if _, err := os.Stat(filepath.Join(root, autoPrompt)); err == nil {
+			t.Prompt = autoPrompt
+			fmt.Fprintf(os.Stderr, "Auto-detected prompt: %s\n", autoPrompt)
+		} else {
+			fmt.Fprintf(os.Stderr, "✗ Cannot advance #%d: no prompt file set\n", t.Num)
+			fmt.Fprintf(os.Stderr, "  Option 1: sesh board --set %d prompt prompts/foo.md\n", t.Num)
+			fmt.Fprintf(os.Stderr, "  Option 2: create prompts/%s.md (auto-detected)\n", t.ID)
+			return 1
+		}
 	}
 
 	// Check prompt file exists (in project root)
@@ -891,6 +993,25 @@ func boardReact(tasksFile string) {
 	if changed {
 		saveTasks(tasksFile, tf)
 	}
+}
+
+// isBlocked returns true if any blockedBy task is not done, and the blocker descriptions
+func isBlocked(t *Task, tf *TasksFile) (bool, string) {
+	if len(t.BlockedBy) == 0 {
+		return false, ""
+	}
+	var blockers []string
+	for _, bNum := range t.BlockedBy {
+		for _, other := range tf.Tasks {
+			if other.Num == bNum && other.Stage != "done" {
+				blockers = append(blockers, fmt.Sprintf("#%d", bNum))
+			}
+		}
+	}
+	if len(blockers) == 0 {
+		return false, ""
+	}
+	return true, strings.Join(blockers, ", ")
 }
 
 // taskPriority returns a sort key: p0=0, p1=1, p2/empty=2
