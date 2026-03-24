@@ -1042,7 +1042,7 @@ func taskPriority(p string) int {
 func workerStatus(worktreePath string) string {
 	// Count commits first (used in multiple places)
 	commits := 0
-	if out, err := exec.Command("git", "-C", worktreePath, "log", "--oneline", "--not", "main").Output(); err == nil {
+	if out, err := exec.Command("git", "-C", worktreePath, "log", "--oneline", "HEAD", "--not", "origin/main").Output(); err == nil {
 		trimmed := strings.TrimSpace(string(out))
 		if trimmed != "" {
 			commits = len(strings.Split(trimmed, "\n"))

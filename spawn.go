@@ -300,7 +300,7 @@ func spawnList() int {
 		}
 
 		// Count commits
-		out, _ := exec.Command("git", "-C", worktree, "log", "--oneline", "feat/"+name, "^main").Output()
+		out, _ := exec.Command("git", "-C", worktree, "log", "--oneline", "feat/"+name, "^origin/main").Output()
 		commits := len(strings.Split(strings.TrimSpace(string(out)), "\n"))
 		if string(out) == "" {
 			commits = 0
@@ -395,7 +395,7 @@ func spawnCollect() int {
 		fmt.Printf("=== %s (%s) ===\n", name, map[bool]string{true: "DONE", false: "running"}[done])
 
 		// Show commits
-		out, _ := exec.Command("git", "-C", worktree, "log", "--oneline", "feat/"+name, "^main").Output()
+		out, _ := exec.Command("git", "-C", worktree, "log", "--oneline", "feat/"+name, "^origin/main").Output()
 		if len(out) > 0 {
 			fmt.Printf("Commits:\n%s\n", string(out))
 		}
@@ -409,7 +409,7 @@ func spawnCollect() int {
 		}
 
 		// Show PRs (check git log for PR URLs)
-		if prOut, err := exec.Command("git", "-C", worktree, "log", "--oneline", "--grep=github.com", "feat/"+name, "^main").Output(); err == nil && len(prOut) > 0 {
+		if prOut, err := exec.Command("git", "-C", worktree, "log", "--oneline", "--grep=github.com", "feat/"+name, "^origin/main").Output(); err == nil && len(prOut) > 0 {
 			fmt.Printf("PRs mentioned in commits:\n%s\n", string(prOut))
 		}
 
