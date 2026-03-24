@@ -397,19 +397,31 @@ func boardRender(tasksFile string) int {
 					line += fmt.Sprintf(" 🔒 blocked by %s", blockers)
 				}
 
-				// Live status for develop tasks
+				// Live status for develop tasks — inline part only
+				workerStatusLine := ""
+				workerActivityLine := ""
 				if t.Stage == "develop" && t.Spawn != "" {
 					wtPath := filepath.Join(filepath.Dir(root), repoName+"-"+t.Spawn)
 					status := workerStatus(wtPath)
-					if status != "" {
-						line += "  " + status
+					// Split: first line is inline status, second line (if any) is activity
+					parts := strings.SplitN(status, "\n", 2)
+					workerStatusLine = parts[0]
+					if len(parts) > 1 {
+						workerActivityLine = parts[1]
 					}
+				}
+
+				if workerStatusLine != "" {
+					line += "  " + workerStatusLine
 				}
 
 				fmt.Println(line)
 
 				if t.Description != "" {
 					fmt.Printf("         %s\n", truncate(t.Description, 75))
+				}
+				if workerActivityLine != "" {
+					fmt.Println(workerActivityLine)
 				}
 				if t.Review != nil && t.Review.Summary != "" {
 					fmt.Printf("         review: %s\n", truncate(t.Review.Summary, 65))
