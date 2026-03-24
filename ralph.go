@@ -396,7 +396,11 @@ func Ralph(cfg RalphConfig, ev *Event) int {
 		}
 
 		if !result.StateWritten {
-			generateFallbackState(i, cfg.StateFile)
+			// Only generate fallback if no state file exists or it was auto-generated
+			// (don't overwrite orchestrator-written state files)
+			if data, err := os.ReadFile(cfg.StateFile); err != nil || strings.Contains(string(data), "auto-generated") {
+				generateFallbackState(i, cfg.StateFile)
+			}
 		}
 	}
 

@@ -141,9 +141,11 @@ func runSpawn(args []string) int {
 	branchName := "feat/" + name
 
 	// Check if worktree already exists — reuse it
+	newWorktree := false
 	if _, err := os.Stat(worktreePath); err == nil {
 		fmt.Fprintf(os.Stderr, "spawn: reusing existing worktree %s\n", name)
 	} else {
+		newWorktree = true
 		fmt.Fprintf(os.Stderr, "spawn: creating worktree %s...\n", name)
 
 		// Create branch (ignore error if exists)
@@ -179,10 +181,13 @@ func runSpawn(args []string) int {
 		}
 	}
 
-	// Remove stale state/done files (inherited from main)
-	os.Remove(filepath.Join(worktreePath, "ralph-state.md"))
-	os.Remove(filepath.Join(worktreePath, ".ralph-done"))
-	os.Remove(filepath.Join(worktreePath, "pipeline-state.md"))
+	// Remove stale state/done files only for NEW worktrees
+	// (reused worktrees may have orchestrator-written state)
+	if newWorktree {
+		os.Remove(filepath.Join(worktreePath, "ralph-state.md"))
+		os.Remove(filepath.Join(worktreePath, ".ralph-done"))
+		os.Remove(filepath.Join(worktreePath, "pipeline-state.md"))
+	}
 
 	// Install deps
 	fmt.Fprintf(os.Stderr, "spawn: installing deps...\n")
