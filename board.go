@@ -1030,11 +1030,12 @@ func taskPriority(p string) int {
 func workerStatus(worktreePath string) string {
 	// Check if done
 	if _, err := os.Stat(filepath.Join(worktreePath, ".ralph-done")); err == nil {
-		return "✓ done"
+		return "[✓ done]"
 	}
 
 	// Check if process is alive via .spawn-meta PID
 	alive := false
+	startedAt := ""
 	metaPath := filepath.Join(worktreePath, ".spawn-meta")
 	if meta, err := os.ReadFile(metaPath); err == nil {
 		for _, line := range strings.Split(string(meta), "\n") {
@@ -1044,20 +1045,56 @@ func workerStatus(worktreePath string) string {
 					alive = true
 				}
 			}
+			if strings.HasPrefix(line, "started=") {
+				startedAt = strings.TrimPrefix(line, "started=")
+			}
 		}
 	}
 
-	// Read state file for iteration info
+	// Read state file for iteration info — extract real content, not the raw header
 	statePath := filepath.Join(worktreePath, "ralph-state.md")
 	iterInfo := ""
+	stateHint := ""
 	if state, err := os.ReadFile(statePath); err == nil {
-		first := strings.Split(string(state), "\n")[0]
-		// Extract "iteration N" from "# Ralph State (updated by iteration N)"
+		lines := strings.Split(string(state), "\n")
+		first := lines[0]
+
+		// Extract iteration number
 		if strings.Contains(first, "iteration") {
 			parts := strings.Split(first, "iteration ")
 			if len(parts) > 1 {
 				iterNum := strings.TrimRight(parts[1], ")")
-				iterInfo = "iter " + iterNum
+				if strings.Contains(first, "auto-generated") {
+					iterInfo = "starting up"
+				} else {
+					iterInfo = "iter " + iterNum
+				}
+			}
+		}
+
+		// Find a useful hint — first TODO item (not done, not a commit hash)
+		inTodo := false
+		for _, l := range lines {
+			l = strings.TrimSpace(l)
+			if strings.HasPrefix(l, "## TODO") {
+				inTodo = true
+				continue
+			}
+			if strings.HasPrefix(l, "## ") {
+				inTodo = false
+			}
+			if inTodo && strings.HasPrefix(l, "- ") {
+				hint := strings.TrimPrefix(l, "- ")
+				hint = strings.TrimPrefix(hint, "[ ] ")
+				// Skip commit hashes and generic items
+				if len(hint) > 7 && (hint[7] == ' ' || hint[6] == ' ') && !strings.Contains(hint, " ") {
+					continue // looks like a hash
+				}
+				if len(hint) > 50 {
+					hint = hint[:50] + "..."
+				}
+				stateHint = hint
+				break
 			}
 		}
 	}
@@ -1065,17 +1102,36 @@ func workerStatus(worktreePath string) string {
 	// Count commits
 	commits := 0
 	if out, err := exec.Command("git", "-C", worktreePath, "log", "--oneline", "--not", "main").Output(); err == nil {
-		lines := strings.Split(strings.TrimSpace(string(out)), "\n")
-		if lines[0] != "" {
-			commits = len(lines)
+		trimmed := strings.TrimSpace(string(out))
+		if trimmed != "" {
+			commits = len(strings.Split(trimmed, "\n"))
 		}
 	}
 
-	parts := []string{}
+	// Elapsed time
+	elapsed := ""
+	if startedAt != "" {
+		if t, err := time.Parse(time.RFC3339, startedAt); err == nil {
+			dur := time.Since(t)
+			if dur < time.Hour {
+				elapsed = fmt.Sprintf("%dm", int(dur.Minutes()))
+			} else {
+				elapsed = fmt.Sprintf("%dh%dm", int(dur.Hours()), int(dur.Minutes())%60)
+			}
+		}
+	}
+
+	// Build status line
+	var parts []string
+
 	if alive {
 		parts = append(parts, "⟳ running")
-	} else if iterInfo != "" {
+	} else {
 		parts = append(parts, "⏸ stopped")
+	}
+
+	if elapsed != "" {
+		parts = append(parts, elapsed)
 	}
 	if iterInfo != "" {
 		parts = append(parts, iterInfo)
@@ -1084,10 +1140,14 @@ func workerStatus(worktreePath string) string {
 		parts = append(parts, fmt.Sprintf("%d commits", commits))
 	}
 
-	if len(parts) == 0 {
-		return ""
+	result := "[" + strings.Join(parts, ", ") + "]"
+
+	// Add hint on next line
+	if stateHint != "" {
+		result += "\n         " + stateHint
 	}
-	return "[" + strings.Join(parts, ", ") + "]"
+
+	return result
 }
 
 func truncate(s string, n int) string {
