@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -248,15 +249,39 @@ func runSpawn(args []string) int {
 		ralphCmd += fmt.Sprintf(" --max-turns %d", maxTurns)
 	}
 
-	// Run as background process (nohup)
+	// Run as background process — use setsid to fully detach from terminal
 	logFile := filepath.Join(worktreePath, ".spawn-log")
-	bgCmd := fmt.Sprintf("nohup bash -c %q > %s 2>&1 & echo $!", ralphCmd, logFile)
-	out, err := exec.Command("bash", "-c", bgCmd).Output()
+	logF, err := os.Create(logFile)
 	if err != nil {
+		fmt.Fprintf(os.Stderr, "spawn: cannot create log file: %v\n", err)
+		return 1
+	}
+
+	cmd := exec.Command("bash", "-c", ralphCmd)
+	cmd.Dir = worktreePath
+	cmd.Stdout = logF
+	cmd.Stderr = logF
+	// Redirect stdin from /dev/null so claude doesn't get SIGTERM
+	devnull, _ := os.Open(os.DevNull)
+	cmd.Stdin = devnull
+	// Create new process group + session so it survives parent exit
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+
+	if err := cmd.Start(); err != nil {
+		logF.Close()
+		devnull.Close()
 		fmt.Fprintf(os.Stderr, "spawn: background launch failed: %v\n", err)
 		return 1
 	}
-	pid := strings.TrimSpace(string(out))
+
+	pid := fmt.Sprintf("%d", cmd.Process.Pid)
+
+	// Release — don't wait for the process
+	go func() {
+		cmd.Wait()
+		logF.Close()
+		devnull.Close()
+	}()
 
 	// Write PID to spawn meta for kill/status
 	metaContent := fmt.Sprintf("prompt=%s\nname=%s\nstarted=%s\nmaxIter=%s\npid=%s\nworktree=%s\n",
