@@ -22,6 +22,7 @@ type Task struct {
 	ID          string         `json:"id"`
 	Title       string         `json:"title"`
 	Description string         `json:"description,omitempty"`
+	Priority    string         `json:"priority,omitempty"` // p0, p1, p2 (empty = p2)
 	Stage       string         `json:"stage"`
 	Prompt      string         `json:"prompt,omitempty"`
 	Spawn       string         `json:"spawn,omitempty"`
@@ -76,6 +77,8 @@ func runBoard(args []string) int {
 	advanceID := ""
 	fixID := ""
 	mergeID := ""
+	prioID := ""
+	prioLevel := ""
 
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
@@ -129,6 +132,15 @@ func runBoard(args []string) int {
 				fmt.Fprintln(os.Stderr, "sesh board --merge requires task ID or number")
 				return 1
 			}
+		case "--priority":
+			if i+2 < len(args) {
+				prioID = args[i+1]
+				prioLevel = args[i+2]
+				i += 2
+			} else {
+				fmt.Fprintln(os.Stderr, "sesh board --priority requires ID and LEVEL (p0/p1/p2)")
+				return 1
+			}
 		case "--help", "-h":
 			fmt.Println(boardUsage)
 			return 0
@@ -146,6 +158,11 @@ func runBoard(args []string) int {
 	// Add task
 	if addTitle != "" {
 		return boardAdd(tasksFile, addTitle)
+	}
+
+	// Set priority
+	if prioID != "" {
+		return boardPriority(tasksFile, prioID, prioLevel)
 	}
 
 	// Move task (escape hatch, no preconditions)
@@ -297,8 +314,19 @@ func boardRender(tasksFile string) int {
 			}
 		}
 
+		// Sort by priority (p0 first, then p1, then p2/empty)
+		for i := 0; i < len(tasks)-1; i++ {
+			for j := i + 1; j < len(tasks); j++ {
+				pi := taskPriority(tasks[i].Priority)
+				pj := taskPriority(tasks[j].Priority)
+				if pj < pi {
+					tasks[i], tasks[j] = tasks[j], tasks[i]
+				}
+			}
+		}
+
 		if len(tasks) == 0 && s.name != "scope" && s.name != "done" {
-			continue // skip empty middle stages
+			continue
 		}
 
 		fmt.Printf("%s (%d)\n", s.label, len(tasks))
@@ -327,7 +355,17 @@ func boardRender(tasksFile string) int {
 					icon = "→"
 				}
 
+				pLabel := ""
+				if t.Priority == "p0" {
+					pLabel = "🔴"
+				} else if t.Priority == "p1" {
+					pLabel = "🟡"
+				}
+
 				line := fmt.Sprintf("  %s #%-3d %s", icon, t.Num, t.Title)
+				if pLabel != "" {
+					line += " " + pLabel
+				}
 				if t.PR > 0 {
 					line += fmt.Sprintf(" [PR #%d]", t.PR)
 				}
@@ -472,6 +510,32 @@ func boardMove(tasksFile, id, stage string) int {
 }
 
 // boardAdvance moves a task to the next stage, checking preconditions.
+func boardPriority(tasksFile, ref, level string) int {
+	valid := map[string]bool{"p0": true, "p1": true, "p2": true}
+	if !valid[level] {
+		fmt.Fprintf(os.Stderr, "sesh board: invalid priority %q (p0/p1/p2)\n", level)
+		return 1
+	}
+
+	tf, err := loadTasks(tasksFile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "sesh board: %v\n", err)
+		return 1
+	}
+
+	t := findTask(tf, ref)
+	if t == nil {
+		fmt.Fprintf(os.Stderr, "sesh board: task %q not found\n", ref)
+		return 1
+	}
+
+	t.Priority = level
+	t.Updated = time.Now().Format(time.RFC3339)
+	saveTasks(tasksFile, tf)
+	fmt.Printf("#%d → %s\n", t.Num, level)
+	return 0
+}
+
 func boardAdvance(tasksFile, ref string) int {
 	tf, err := loadTasks(tasksFile)
 	if err != nil {
@@ -826,6 +890,18 @@ func boardReact(tasksFile string) {
 
 	if changed {
 		saveTasks(tasksFile, tf)
+	}
+}
+
+// taskPriority returns a sort key: p0=0, p1=1, p2/empty=2
+func taskPriority(p string) int {
+	switch p {
+	case "p0":
+		return 0
+	case "p1":
+		return 1
+	default:
+		return 2
 	}
 }
 
