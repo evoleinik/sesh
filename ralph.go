@@ -453,12 +453,9 @@ func runIterationN(ctx context.Context, prompt string, maxTurns int, extraEnv []
 		return IterResult{ExitCode: 1, Duration: time.Since(start)}
 	}
 
-	fmt.Fprintf(os.Stderr, "ralph: DEBUG starting claude pid=")
 	if err := cmd.Start(); err != nil {
-		fmt.Fprintf(os.Stderr, "FAIL: %v\n", err)
 		return IterResult{ExitCode: 1, Duration: time.Since(start)}
 	}
-	fmt.Fprintf(os.Stderr, "%d args=%d prompt_len=%d\n", cmd.Process.Pid, len(args), len(prompt))
 
 	// Forward stderr in background
 	go func() {
