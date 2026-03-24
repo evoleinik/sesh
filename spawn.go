@@ -100,6 +100,10 @@ func runSpawn(args []string) int {
 				fmt.Sscanf(args[i], "%d", &maxTurns)
 			}
 		default:
+			if strings.HasPrefix(args[i], "-") {
+				fmt.Fprintf(os.Stderr, "sesh spawn: unknown flag: %s\n", args[i])
+				return 1
+			}
 			rest = append(rest, args[i])
 		}
 	}
