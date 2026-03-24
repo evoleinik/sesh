@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -237,16 +238,14 @@ func runSpawn(args []string) int {
 		promptFile, name, time.Now().Format(time.RFC3339), maxIter)
 	os.WriteFile(filepath.Join(worktreePath, ".spawn-meta"), []byte(meta), 0644)
 
-	// Build ralph command
-	// Build ralph command — always runs from the worktree directory
-	ralphCmd := fmt.Sprintf("cd %s && sesh ralph %s %s", worktreePath, promptFile, maxIter)
+	// Build ralph args — exec sesh directly (no bash wrapper)
+	ralphArgs := []string{"ralph", promptFile, maxIter}
 	if promptText != "" {
-		// Append worktree path context so prompts know where they are
 		fullText := fmt.Sprintf("Working directory: %s\n\n%s", worktreePath, promptText)
-		ralphCmd += fmt.Sprintf(" -p %q", fullText)
+		ralphArgs = append(ralphArgs, "-p", fullText)
 	}
 	if maxTurns != 100 {
-		ralphCmd += fmt.Sprintf(" --max-turns %d", maxTurns)
+		ralphArgs = append(ralphArgs, "--max-turns", strconv.Itoa(maxTurns))
 	}
 
 	// Run as background process — use setsid to fully detach from terminal
@@ -257,7 +256,8 @@ func runSpawn(args []string) int {
 		return 1
 	}
 
-	cmd := exec.Command("bash", "-c", ralphCmd)
+	seshBin, _ := os.Executable()
+	cmd := exec.Command(seshBin, ralphArgs...)
 	cmd.Dir = worktreePath
 	cmd.Stdout = logF
 	cmd.Stderr = logF
