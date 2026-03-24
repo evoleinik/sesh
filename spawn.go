@@ -191,6 +191,21 @@ func runSpawn(args []string) int {
 		os.Remove(filepath.Join(worktreePath, "pipeline-state.md"))
 	}
 
+	// Clear stale Claude project cache to prevent SIGTERM on corrupt session state
+	// (stale .jsonl files from failed sessions cause claude to exit immediately)
+	home, _ := os.UserHomeDir()
+	absWT, _ := filepath.Abs(worktreePath)
+	cacheSlug := "-" + strings.ReplaceAll(strings.TrimPrefix(absWT, "/"), "/", "-")
+	cachePath := filepath.Join(home, ".claude", "projects", cacheSlug)
+	if entries, err := os.ReadDir(cachePath); err == nil {
+		for _, e := range entries {
+			if strings.HasSuffix(e.Name(), ".jsonl") {
+				os.Remove(filepath.Join(cachePath, e.Name()))
+			}
+		}
+		fmt.Fprintf(os.Stderr, "spawn: cleared %d stale session files\n", len(entries))
+	}
+
 	// Install deps
 	fmt.Fprintf(os.Stderr, "spawn: installing deps...\n")
 	install := exec.Command("bun", "install")
