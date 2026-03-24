@@ -13,10 +13,12 @@ import (
 type TasksFile struct {
 	Schema  string `json:"$schema"`
 	Updated string `json:"updated"`
+	NextNum int    `json:"nextNum"`
 	Tasks   []Task `json:"tasks"`
 }
 
 type Task struct {
+	Num         int         `json:"num"`
 	ID          string      `json:"id"`
 	Title       string      `json:"title"`
 	Description string      `json:"description,omitempty"`
@@ -219,11 +221,10 @@ func boardRender(tasksFile string) int {
 		fmt.Printf("%s (%d)\n", s.label, len(tasks))
 
 		if s.name == "done" {
-			// Two-column for done items
 			for i := 0; i < len(tasks); i += 2 {
-				left := fmt.Sprintf("  ✓ %s", truncate(tasks[i].Title, 35))
+				left := fmt.Sprintf("  ✓ #%-3d %s", tasks[i].Num, truncate(tasks[i].Title, 32))
 				if i+1 < len(tasks) {
-					right := fmt.Sprintf("✓ %s", truncate(tasks[i+1].Title, 35))
+					right := fmt.Sprintf("✓ #%-3d %s", tasks[i+1].Num, truncate(tasks[i+1].Title, 32))
 					fmt.Printf("%-45s %s\n", left, right)
 				} else {
 					fmt.Println(left)
@@ -231,26 +232,26 @@ func boardRender(tasksFile string) int {
 			}
 		} else {
 			for _, t := range tasks {
-				prefix := "  "
+				icon := " "
 				if t.Stage == "develop" {
-					prefix = "  ● "
+					icon = "●"
 				} else if t.Stage == "code_review" || t.Stage == "qa" {
-					prefix = "  ⚠ "
+					icon = "⚠"
 				} else if t.Stage == "deploy" {
-					prefix = "  → "
+					icon = "→"
 				}
 
-				line := prefix + t.Title
+				line := fmt.Sprintf("  %s #%-3d %s", icon, t.Num, t.Title)
 				if t.PR > 0 {
 					line += fmt.Sprintf(" [PR #%d]", t.PR)
 				}
 				fmt.Println(line)
 
 				if t.Description != "" {
-					fmt.Printf("    %s\n", truncate(t.Description, 80))
+					fmt.Printf("         %s\n", truncate(t.Description, 75))
 				}
 				if t.Review != nil && t.Review.Summary != "" {
-					fmt.Printf("    review: %s\n", truncate(t.Review.Summary, 70))
+					fmt.Printf("         review: %s\n", truncate(t.Review.Summary, 65))
 				}
 			}
 		}
@@ -277,7 +278,14 @@ func boardAdd(tasksFile, title string) int {
 		id = id[:40]
 	}
 
+	if tf.NextNum == 0 {
+		tf.NextNum = 1
+	}
+	num := tf.NextNum
+	tf.NextNum++
+
 	tf.Tasks = append(tf.Tasks, Task{
+		Num:     num,
 		ID:      id,
 		Title:   title,
 		Stage:   "scope",
@@ -289,7 +297,7 @@ func boardAdd(tasksFile, title string) int {
 		return 1
 	}
 
-	fmt.Printf("Added: %s → SCOPE\n", title)
+	fmt.Printf("Added: #%d %s → SCOPE\n", num, title)
 	return 0
 }
 
@@ -310,14 +318,18 @@ func boardMove(tasksFile, id, stage string) int {
 	}
 
 	found := false
+	num := 0
+	fmt.Sscanf(id, "%d", &num)
+
 	for i := range tf.Tasks {
-		if tf.Tasks[i].ID == id {
+		if tf.Tasks[i].ID == id || (num > 0 && tf.Tasks[i].Num == num) {
 			tf.Tasks[i].Stage = stage
 			tf.Tasks[i].Updated = time.Now().Format(time.RFC3339)
 			if stage == "done" {
 				tf.Tasks[i].Merged = time.Now().Format("2006-01-02")
 			}
 			found = true
+			id = tf.Tasks[i].ID // for the success message
 			break
 		}
 	}
