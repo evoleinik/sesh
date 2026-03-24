@@ -21,7 +21,8 @@ var spawnUsage = `Usage: sesh spawn [flags] <prompt.md> [max-iterations]
   sesh spawn --list          List running spawned loops
   sesh spawn --check NAME    Check a loop's state
   sesh spawn --log NAME [N]  Show digested session logs (last N sessions, default 1)
-  sesh spawn --kill NAME     Kill a loop
+  sesh spawn --stop NAME     Stop the process (keep worktree + branch)
+  sesh spawn --kill NAME     Stop + remove worktree + branch (refuses if unpushed commits)
   sesh spawn --collect       Show results from all finished loops`
 
 func runSpawn(args []string) int {
@@ -40,6 +41,12 @@ func runSpawn(args []string) int {
 			return 1
 		}
 		return spawnCheck(args[1])
+	case "--stop", "stop":
+		if len(args) < 2 {
+			fmt.Fprintln(os.Stderr, "sesh spawn --stop requires a name")
+			return 1
+		}
+		return spawnStop(args[1])
 	case "--kill", "kill":
 		if len(args) < 2 {
 			fmt.Fprintln(os.Stderr, "sesh spawn --kill requires a name")
@@ -344,25 +351,68 @@ func spawnCheck(name string) int {
 	return 0
 }
 
-func spawnKill(name string) int {
-	// Kill tmux window
-	tmuxWindow := strings.ToUpper(strings.ReplaceAll(name, "-", "_"))
-	exec.Command("tmux", "kill-window", "-t", tmuxWindow).Run()
-
-	// Remove worktree
+// spawnStop stops the process but keeps the worktree and branch
+func spawnStop(name string) int {
 	projectRoot, _ := findGitRoot()
 	repoName := filepath.Base(projectRoot)
 	worktree := filepath.Join(filepath.Dir(projectRoot), repoName+"-"+name)
 
+	// Kill the process via PID
+	metaPath := filepath.Join(worktree, ".spawn-meta")
+	if meta, err := os.ReadFile(metaPath); err == nil {
+		for _, line := range strings.Split(string(meta), "\n") {
+			if strings.HasPrefix(line, "pid=") {
+				pid := strings.TrimPrefix(line, "pid=")
+				exec.Command("kill", pid).Run()
+				fmt.Fprintf(os.Stderr, "spawn: stopped process %s\n", pid)
+			}
+		}
+	}
+
+	fmt.Fprintf(os.Stderr, "spawn: stopped %s (worktree kept at %s)\n", name, worktree)
+	return 0
+}
+
+// spawnKill removes the worktree and branch — only if safe
+func spawnKill(name string) int {
+	projectRoot, _ := findGitRoot()
+	repoName := filepath.Base(projectRoot)
+	worktree := filepath.Join(filepath.Dir(projectRoot), repoName+"-"+name)
+	branchName := "feat/" + name
+
+	// Safety check: count unpushed commits
+	if _, err := os.Stat(worktree); err == nil {
+		out, err := exec.Command("git", "-C", worktree, "log", "--oneline", "HEAD", "--not", "origin/main").Output()
+		if err == nil {
+			commits := strings.TrimSpace(string(out))
+			if commits != "" {
+				// Check if pushed to remote
+				remoteOut, _ := exec.Command("git", "-C", worktree, "log", "--oneline", "HEAD", "--not", "origin/"+branchName).Output()
+				unpushed := strings.TrimSpace(string(remoteOut))
+				if unpushed != "" {
+					lines := strings.Split(unpushed, "\n")
+					fmt.Fprintf(os.Stderr, "spawn: REFUSING to kill %s — %d unpushed commits\n", name, len(lines))
+					fmt.Fprintf(os.Stderr, "  Push first: cd %s && git push origin %s\n", worktree, branchName)
+					fmt.Fprintf(os.Stderr, "  Or stop only: sesh spawn --stop %s\n", name)
+					return 1
+				}
+			}
+		}
+	}
+
+	// Stop the process first
+	spawnStop(name)
+
+	// Remove worktree
 	out, err := exec.Command("git", "-C", projectRoot, "worktree", "remove", "--force", worktree).CombinedOutput()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "spawn: worktree remove failed: %s\n%s\n", err, out)
 	}
 
 	// Delete branch
-	exec.Command("git", "-C", projectRoot, "branch", "-D", "feat/"+name).Run()
+	exec.Command("git", "-C", projectRoot, "branch", "-D", branchName).Run()
 
-	fmt.Fprintf(os.Stderr, "spawn: killed %s\n", name)
+	fmt.Fprintf(os.Stderr, "spawn: killed %s (worktree + branch removed)\n", name)
 	return 0
 }
 
