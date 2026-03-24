@@ -314,6 +314,9 @@ func boardRender(tasksFile string) int {
 				}
 			}
 		} else {
+			root, _ := findGitRoot()
+			repoName := filepath.Base(root)
+
 			for _, t := range tasks {
 				icon := " "
 				if t.Stage == "develop" {
@@ -328,6 +331,16 @@ func boardRender(tasksFile string) int {
 				if t.PR > 0 {
 					line += fmt.Sprintf(" [PR #%d]", t.PR)
 				}
+
+				// Live status for develop tasks
+				if t.Stage == "develop" && t.Spawn != "" {
+					wtPath := filepath.Join(filepath.Dir(root), repoName+"-"+t.Spawn)
+					status := workerStatus(wtPath)
+					if status != "" {
+						line += "  " + status
+					}
+				}
+
 				fmt.Println(line)
 
 				if t.Description != "" {
@@ -773,6 +786,70 @@ func boardReact(tasksFile string) {
 	if changed {
 		saveTasks(tasksFile, tf)
 	}
+}
+
+// workerStatus returns a short status string for a worker in a worktree
+func workerStatus(worktreePath string) string {
+	// Check if done
+	if _, err := os.Stat(filepath.Join(worktreePath, ".ralph-done")); err == nil {
+		return "✓ done"
+	}
+
+	// Check if process is alive via .spawn-meta PID
+	alive := false
+	metaPath := filepath.Join(worktreePath, ".spawn-meta")
+	if meta, err := os.ReadFile(metaPath); err == nil {
+		for _, line := range strings.Split(string(meta), "\n") {
+			if strings.HasPrefix(line, "pid=") {
+				pid := strings.TrimPrefix(line, "pid=")
+				if exec.Command("kill", "-0", pid).Run() == nil {
+					alive = true
+				}
+			}
+		}
+	}
+
+	// Read state file for iteration info
+	statePath := filepath.Join(worktreePath, "ralph-state.md")
+	iterInfo := ""
+	if state, err := os.ReadFile(statePath); err == nil {
+		first := strings.Split(string(state), "\n")[0]
+		// Extract "iteration N" from "# Ralph State (updated by iteration N)"
+		if strings.Contains(first, "iteration") {
+			parts := strings.Split(first, "iteration ")
+			if len(parts) > 1 {
+				iterNum := strings.TrimRight(parts[1], ")")
+				iterInfo = "iter " + iterNum
+			}
+		}
+	}
+
+	// Count commits
+	commits := 0
+	if out, err := exec.Command("git", "-C", worktreePath, "log", "--oneline", "--not", "main").Output(); err == nil {
+		lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+		if lines[0] != "" {
+			commits = len(lines)
+		}
+	}
+
+	parts := []string{}
+	if alive {
+		parts = append(parts, "⟳ running")
+	} else if iterInfo != "" {
+		parts = append(parts, "⏸ stopped")
+	}
+	if iterInfo != "" {
+		parts = append(parts, iterInfo)
+	}
+	if commits > 0 {
+		parts = append(parts, fmt.Sprintf("%d commits", commits))
+	}
+
+	if len(parts) == 0 {
+		return ""
+	}
+	return "[" + strings.Join(parts, ", ") + "]"
 }
 
 func truncate(s string, n int) string {
