@@ -50,7 +50,7 @@ type RalphConfig struct {
 
 // readPreamble loads the preamble template and substitutes placeholders.
 // Checks ~/src/sesh/prompts/ first (hot-editable), falls back to embedded copy.
-func readPreamble(iter, max int, stateFile string, planMode bool) string {
+func readPreamble(iter, max int, stateFile, doneFile string, planMode bool) string {
 	home, _ := os.UserHomeDir()
 
 	var embedded, filename string
@@ -71,6 +71,7 @@ func readPreamble(iter, max int, stateFile string, planMode bool) string {
 	s = strings.ReplaceAll(s, "{{ITER}}", strconv.Itoa(iter))
 	s = strings.ReplaceAll(s, "{{MAX}}", strconv.Itoa(max))
 	s = strings.ReplaceAll(s, "{{STATE_FILE}}", stateFile)
+	s = strings.ReplaceAll(s, "{{DONE_FILE}}", doneFile)
 	return s
 }
 
@@ -80,6 +81,8 @@ func runRalph(args []string) int {
 	promptText := ""
 	envFile := ""
 	steerScript := ""
+	stateFile := ""
+	doneFile := ""
 	maxTurns := 100
 	var rest []string
 	for i := 0; i < len(args); i++ {
@@ -125,21 +128,39 @@ func runRalph(args []string) int {
 			}
 		case "--no-steer":
 			steerScript = "none"
+		case "--state":
+			i++
+			if i < len(args) {
+				stateFile = args[i]
+			} else {
+				fmt.Fprintln(os.Stderr, "sesh ralph: --state requires a value")
+				return 1
+			}
+		case "--done":
+			i++
+			if i < len(args) {
+				doneFile = args[i]
+			} else {
+				fmt.Fprintln(os.Stderr, "sesh ralph: --done requires a value")
+				return 1
+			}
 		default:
 			rest = append(rest, args[i])
 		}
 	}
 
 	if promptText == "" && len(rest) < 1 {
-		fmt.Fprintln(os.Stderr, "Usage: sesh ralph [--plan] [--max-turns N] [--env FILE] [--steer PATH] [--no-steer] [-p TEXT] [PROMPT.md] [max-iterations]")
+		fmt.Fprintln(os.Stderr, "Usage: sesh ralph [--plan] [--max-turns N] [--env FILE] [--steer PATH] [--no-steer] [--state FILE] [--done FILE] [-p TEXT] [PROMPT.md] [max-iterations]")
 		fmt.Fprintln(os.Stderr, "  -p TEXT        Extra prompt text (appended after file, or standalone)")
 		fmt.Fprintln(os.Stderr, "  --plan         Adversarial plan refinement mode (default 5 iterations)")
 		fmt.Fprintln(os.Stderr, "  --max-turns N  Claude Code max turns per iteration (default 100)")
 		fmt.Fprintln(os.Stderr, "  --env FILE     Load env vars from file (KEY=VALUE format, # comments)")
 		fmt.Fprintln(os.Stderr, "  --steer PATH   Use specific steering script (default: auto-detect)")
 		fmt.Fprintln(os.Stderr, "  --no-steer     Disable steering")
-		fmt.Fprintln(os.Stderr, "  Stop: create .ralph-done or hit max iterations")
-		fmt.Fprintln(os.Stderr, "  State: ralph-state.md (read/written each iteration)")
+		fmt.Fprintln(os.Stderr, "  --state FILE   Custom state file (default: ralph-state.md)")
+		fmt.Fprintln(os.Stderr, "  --done FILE    Custom done file (default: .ralph-done)")
+		fmt.Fprintln(os.Stderr, "  Stop: create done file or hit max iterations")
+		fmt.Fprintln(os.Stderr, "  State: read/written each iteration")
 		return 1
 	}
 
@@ -195,8 +216,8 @@ func runRalph(args []string) int {
 		PlanMode:    planMode,
 		EnvFile:     envFile,
 		SteerScript: steerScript,
-		StateFile:   "ralph-state.md",
-		DoneFile:    ".ralph-done",
+		StateFile:   stateFile,
+		DoneFile:    doneFile,
 		Stdout:      os.Stdout,
 		Stderr:      os.Stderr,
 	}
@@ -285,6 +306,7 @@ func Ralph(cfg RalphConfig, ev *Event) int {
 
 	lastHead := gitHead()
 	stallCount := 0
+	fastExitCount := 0
 	var lastOutput []byte
 
 	for i := 1; i <= cfg.MaxIter; i++ {
@@ -312,9 +334,17 @@ func Ralph(cfg RalphConfig, ev *Event) int {
 			}
 		}
 
-		prompt := buildPrompt(i, cfg.MaxIter, cfg.StateFile, cfg.PromptFile, cfg.PromptText, stallCount, cfg.PlanMode, steerOutput)
+		prompt := buildPrompt(i, cfg.MaxIter, cfg.StateFile, cfg.DoneFile, cfg.PromptFile, cfg.PromptText, stallCount, cfg.PlanMode, steerOutput)
 		result := RunIteration(ctx, prompt, cfg.MaxTurns, extraEnv, cfg.Stdout)
 		lastOutput = result.Output
+
+		// check done/state files
+		if _, err := os.Stat(cfg.DoneFile); err == nil {
+			result.DoneFile = true
+		}
+		if _, err := os.Stat(cfg.StateFile); err == nil {
+			result.StateWritten = true
+		}
 
 		// stall detection: did git HEAD change?
 		head := gitHead()
@@ -326,6 +356,22 @@ func Ralph(cfg RalphConfig, ev *Event) int {
 		} else {
 			stallCount = 0
 			lastHead = head
+		}
+
+		// Fast-exit detection: if iteration completed in <5s, Claude likely never started
+		if result.Duration < 5*time.Second && !result.DoneFile {
+			fastExitCount++
+			fmt.Fprintf(cfg.Stderr, "ralph: ⚠ FAST EXIT — iteration completed in %s (expected 30s+), exit code %d\n", fmtDuration(result.Duration), result.ExitCode)
+			if fastExitCount >= 2 {
+				fmt.Fprintf(cfg.Stderr, "ralph: stopping — %d consecutive fast exits, Claude is not starting\n", fastExitCount)
+				printIterSummary(cfg.Stderr, i, result, time.Since(loopStart))
+				if ev != nil {
+					ev.Iterations = i
+				}
+				return 1
+			}
+		} else {
+			fastExitCount = 0
 		}
 
 		printIterSummary(cfg.Stderr, i, result, time.Since(loopStart))
@@ -436,21 +482,14 @@ func RunIteration(ctx context.Context, prompt string, maxTurns int, extraEnv []s
 		result.Interrupted = true
 	}
 
-	if _, err := os.Stat(".ralph-done"); err == nil {
-		result.DoneFile = true
-	}
-	if _, err := os.Stat("ralph-state.md"); err == nil {
-		result.StateWritten = true
-	}
-
 	return result
 }
 
-func buildPrompt(iter, max int, stateFile, promptFile, promptText string, stallCount int, planMode bool, steerOutput string) string {
+func buildPrompt(iter, max int, stateFile, doneFile, promptFile, promptText string, stallCount int, planMode bool, steerOutput string) string {
 	var b strings.Builder
 
 	// preamble (read from disk each iteration — editable without rebuild)
-	b.WriteString(readPreamble(iter, max, stateFile, planMode))
+	b.WriteString(readPreamble(iter, max, stateFile, doneFile, planMode))
 	b.WriteString("\n")
 
 	// Steering signal (replaces stall warning when active)
@@ -469,10 +508,10 @@ func buildPrompt(iter, max int, stateFile, promptFile, promptText string, stallC
 ### STALL DETECTED — %d consecutive iterations with zero commits
 
 Previous iterations explored the codebase but changed nothing. You MUST either:
-1. **Create .ralph-done** if all work is complete (including if remaining items are BLOCKED)
+1. **Create the done file** if all work is complete (including if remaining items are BLOCKED)
 2. **Make a concrete code change and commit it** — not audit, not explore, not review
 
-If the TODO is empty and BLOCKED items require user action, create .ralph-done NOW.
+If the TODO is empty and BLOCKED items require user action, create the done file NOW.
 Do NOT re-audit. Do NOT start a server. Do NOT take screenshots.
 
 ---
@@ -532,7 +571,7 @@ func resolveSteerScript(configured string) string {
 // runSteering executes the steering script, feeding it the original task,
 // last iteration's output, and state file via stdin.
 func runSteering(script string, iterOutput []byte, cfg RalphConfig) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "bash", script, "-")
 
@@ -552,7 +591,7 @@ func runSteering(script string, iterOutput []byte, cfg RalphConfig) (string, err
 	stdin.WriteString("\n\n---\n\n## Agent Output (last iteration)\n\n")
 	stdin.Write(iterOutput)
 	if state, err := os.ReadFile(cfg.StateFile); err == nil {
-		stdin.WriteString("\n\n---\n\n## State File (ralph-state.md)\n\n")
+		stdin.WriteString("\n\n---\n\n## State File (" + cfg.StateFile + ")\n\n")
 		stdin.Write(state)
 	}
 	cmd.Stdin = &stdin

@@ -19,6 +19,8 @@ Commands:
   fmt                      Format stream-json from stdin
   install                  One-shot setup (hooks, gitignore, cron)
   ralph [--plan] [-p TEXT] [FILE] [N]  Agent loop (-p: inline prompt)
+  spawn <prompt.md> [N]    Spawn Ralph in a new worktree
+  board [--watch]          Task board (read from tasks.json)
   cron-curate              Curate projects with new digests
   doctor                   System health check
 
@@ -56,6 +58,10 @@ func run() int {
 		return runFmt(os.Args[2:])
 	case "ralph":
 		return runRalph(os.Args[2:])
+	case "spawn":
+		return runSpawn(os.Args[2:])
+	case "board":
+		return runBoard(os.Args[2:])
 	case "install":
 		return runInstall(os.Args[2:])
 	case "cron-curate":
