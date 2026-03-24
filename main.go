@@ -62,6 +62,8 @@ func run() int {
 		return runSpawn(os.Args[2:])
 	case "board":
 		return runBoard(os.Args[2:])
+	case "transcript":
+		return runTranscript(os.Args[2:])
 	case "install":
 		return runInstall(os.Args[2:])
 	case "cron-curate":
