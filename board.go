@@ -370,8 +370,6 @@ func boardRender(tasksFile string) int {
 				icon := " "
 				if t.Stage == "develop" {
 					icon = "●"
-				} else if t.Stage == "review" {
-					icon = "⚠"
 				} else if t.Stage == "approve" {
 					icon = "→"
 				}
@@ -394,6 +392,14 @@ func boardRender(tasksFile string) int {
 				// Blocked status
 				if blocked, blockers := isBlocked(&t, tf); blocked {
 					line += fmt.Sprintf(" 🔒 blocked by %s", blockers)
+				}
+
+				// Review status — check PR and show what's needed
+				if t.Stage == "review" && t.PR > 0 {
+					reviewHint := reviewStatus(t.PR)
+					if reviewHint != "" {
+						line += "  " + reviewHint
+					}
 				}
 
 				// Live status for develop tasks — inline part only
@@ -1023,6 +1029,34 @@ func isBlocked(t *Task, tf *TasksFile) (bool, string) {
 		return false, ""
 	}
 	return true, strings.Join(blockers, ", ")
+}
+
+// reviewStatus checks a PR and returns a short status hint
+func reviewStatus(pr int) string {
+	out, err := exec.Command("gh", "pr", "view", fmt.Sprintf("%d", pr),
+		"--json", "statusCheckRollup,reviewDecision,mergeable",
+		"--jq", `{ci: [.statusCheckRollup[]? | .conclusion] | join(","), decision: .reviewDecision, mergeable: .mergeable}`,
+	).Output()
+	if err != nil {
+		return ""
+	}
+
+	result := strings.TrimSpace(string(out))
+
+	if strings.Contains(result, "FAILURE") {
+		return "❌ CI failing"
+	}
+	if strings.Contains(result, "CHANGES_REQUESTED") {
+		return "❌ changes requested"
+	}
+	if strings.Contains(result, "APPROVED") {
+		return "✅ approved — advance to approve"
+	}
+	if strings.Contains(result, "PENDING") || strings.Contains(result, "IN_PROGRESS") {
+		return "⏳ CI running"
+	}
+
+	return "👀 awaiting review"
 }
 
 // taskPriority returns a sort key: p0=0, p1=1, p2/empty=2
