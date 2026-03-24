@@ -354,6 +354,47 @@ func boardRender(tasksFile string) int {
 		fmt.Println()
 	}
 
+	// Recent activity log — last 10 events across all tasks
+	type event struct {
+		num   int
+		title string
+		stage string
+		note  string
+		at    string
+	}
+	var events []event
+	for _, t := range tf.Tasks {
+		for _, h := range t.History {
+			events = append(events, event{t.Num, t.Title, h.Stage, h.Note, h.At})
+		}
+	}
+	// Sort by time descending
+	for i := 0; i < len(events)-1; i++ {
+		for j := i + 1; j < len(events); j++ {
+			if events[j].at > events[i].at {
+				events[i], events[j] = events[j], events[i]
+			}
+		}
+	}
+	if len(events) > 10 {
+		events = events[:10]
+	}
+	if len(events) > 0 {
+		fmt.Println("RECENT")
+		for _, e := range events {
+			ts := e.at
+			if t, err := time.Parse(time.RFC3339, e.at); err == nil {
+				ts = t.Format("Jan 02 15:04")
+			}
+			note := ""
+			if e.note != "" {
+				note = " — " + e.note
+			}
+			fmt.Printf("  %s  #%-3d → %s%s\n", ts, e.num, e.stage, note)
+		}
+		fmt.Println()
+	}
+
 	return 0
 }
 
