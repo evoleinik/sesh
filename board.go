@@ -66,7 +66,7 @@ var boardUsage = `Usage: sesh board [flags]
   sesh board --json          Output raw tasks.json
   sesh board --file PATH     Use specific tasks file
 
-  Pipeline: scope → develop → code_review → deploy → done
+  Pipeline: scope → develop → review → approve → done
   Tasks are referenced by number (#7) or ID (tuco-qa).
   Tasks can be blocked: --set 7 blocked-by 6 (unblock: --set 7 unblock 6)`
 
@@ -320,13 +320,14 @@ func boardRender(tasksFile string) int {
 	}{
 		{"scope", "SCOPE"},
 		{"develop", "DEVELOP"},
-		{"code_review", "CODE REVIEW"},
-		{"qa", "QA"},
-		{"deploy", "DEPLOY"},
+		{"review", "REVIEW"},
+		{"approve", "APPROVE"},
 		{"done", "DONE"},
 	}
 
-	fmt.Printf("sesh board — %s\n\n", time.Now().Format("2006-01-02 15:04"))
+	fmt.Printf("sesh board — %s\n", time.Now().Format("2006-01-02 15:04"))
+	fmt.Println("scope → develop → review → approve → done")
+	fmt.Println()
 
 	for _, s := range stages {
 		var tasks []Task
@@ -354,14 +355,12 @@ func boardRender(tasksFile string) int {
 		fmt.Printf("%s (%d)\n", s.label, len(tasks))
 
 		if s.name == "done" {
-			for i := 0; i < len(tasks); i += 2 {
-				left := fmt.Sprintf("  ✓ #%-3d %s", tasks[i].Num, truncate(tasks[i].Title, 32))
-				if i+1 < len(tasks) {
-					right := fmt.Sprintf("✓ #%-3d %s", tasks[i+1].Num, truncate(tasks[i+1].Title, 32))
-					fmt.Printf("%-45s %s\n", left, right)
-				} else {
-					fmt.Println(left)
+			for _, t := range tasks {
+				pr := ""
+				if t.PR > 0 {
+					pr = fmt.Sprintf(" PR #%d", t.PR)
 				}
+				fmt.Printf("  ✓ #%-3d %s%s\n", t.Num, truncate(t.Title, 55), pr)
 			}
 		} else {
 			root, _ := findGitRoot()
@@ -371,9 +370,9 @@ func boardRender(tasksFile string) int {
 				icon := " "
 				if t.Stage == "develop" {
 					icon = "●"
-				} else if t.Stage == "code_review" || t.Stage == "qa" {
+				} else if t.Stage == "review" {
 					icon = "⚠"
-				} else if t.Stage == "deploy" {
+				} else if t.Stage == "approve" {
 					icon = "→"
 				}
 
@@ -523,11 +522,11 @@ func boardMove(tasksFile, id, stage string) int {
 	}
 
 	valid := map[string]bool{
-		"scope": true, "develop": true, "code_review": true,
-		"qa": true, "deploy": true, "done": true,
+		"scope": true, "develop": true, "review": true,
+		"approve": true, "done": true,
 	}
 	if !valid[stage] {
-		fmt.Fprintf(os.Stderr, "sesh board: invalid stage %q (scope/develop/code_review/qa/deploy/done)\n", stage)
+		fmt.Fprintf(os.Stderr, "sesh board: invalid stage %q (scope/develop/review/approve/done)\n", stage)
 		return 1
 	}
 
@@ -653,9 +652,9 @@ func boardAdvance(tasksFile, ref string) int {
 		return advanceScopeToDevelop(tasksFile, tf, t)
 	case "develop":
 		return advanceDevelopToCodeReview(tasksFile, tf, t)
-	case "code_review":
+	case "review":
 		return advanceCodeReviewToDeploy(tasksFile, tf, t)
-	case "deploy":
+	case "approve":
 		fmt.Fprintf(os.Stderr, "Cannot advance from deploy — use `sesh board --merge %d`\n", t.Num)
 		return 1
 	case "done":
@@ -778,9 +777,9 @@ func advanceDevelopToCodeReview(tasksFile string, tf *TasksFile, t *Task) int {
 		}
 	}
 
-	transition(t, "code_review", fmt.Sprintf("PR #%d", t.PR))
+	transition(t, "review", fmt.Sprintf("PR #%d", t.PR))
 	saveTasks(tasksFile, tf)
-	fmt.Printf("✓ #%d advanced: develop → code_review [PR #%d]\n", t.Num, t.PR)
+	fmt.Printf("✓ #%d advanced: develop → review [PR #%d]\n", t.Num, t.PR)
 	return 0
 }
 
@@ -815,9 +814,9 @@ func advanceCodeReviewToDeploy(tasksFile string, tf *TasksFile, t *Task) int {
 		}
 	}
 
-	transition(t, "deploy", "CI green, review clean")
+	transition(t, "approve", "CI green, review clean")
 	saveTasks(tasksFile, tf)
-	fmt.Printf("✓ #%d advanced: code_review → deploy [PR #%d ready to merge]\n", t.Num, t.PR)
+	fmt.Printf("✓ #%d advanced: review → approve [PR #%d ready to merge]\n", t.Num, t.PR)
 	return 0
 }
 
@@ -835,8 +834,8 @@ func boardFix(tasksFile, ref string) int {
 		return 1
 	}
 
-	if t.Stage != "code_review" && t.Stage != "develop" {
-		fmt.Fprintf(os.Stderr, "✗ Cannot fix #%d: task is in %s, not code_review\n", t.Num, t.Stage)
+	if t.Stage != "review" && t.Stage != "develop" {
+		fmt.Fprintf(os.Stderr, "✗ Cannot fix #%d: task is in %s, not review\n", t.Num, t.Stage)
 		return 1
 	}
 
@@ -896,7 +895,7 @@ Branch: %s
 
 	transition(t, "develop", "fix spawned for review issues")
 	saveTasks(tasksFile, tf)
-	fmt.Printf("✓ #%d fix spawned: code_review → develop\n", t.Num)
+	fmt.Printf("✓ #%d fix spawned: review → develop\n", t.Num)
 	return 0
 }
 
@@ -914,7 +913,7 @@ func boardMerge(tasksFile, ref string) int {
 		return 1
 	}
 
-	if t.Stage != "deploy" {
+	if t.Stage != "approve" {
 		fmt.Fprintf(os.Stderr, "✗ Cannot merge #%d: task is in %s, not deploy\n", t.Num, t.Stage)
 		fmt.Fprintln(os.Stderr, "  Advance to deploy first: sesh board --advance", ref)
 		return 1
@@ -957,12 +956,12 @@ func boardReact(tasksFile string) {
 	for i := range tf.Tasks {
 		t := &tf.Tasks[i]
 
-		// Auto-advance develop → code_review when worker finishes
+		// Auto-advance develop → review when worker finishes
 		if t.Stage == "develop" && t.Spawn != "" {
 			worktreePath := filepath.Join(filepath.Dir(root), repoName+"-"+t.Spawn)
 			doneFile := filepath.Join(worktreePath, ".ralph-done")
 			if _, err := os.Stat(doneFile); err == nil {
-				fmt.Fprintf(os.Stderr, "  [react] #%d worker finished — advancing to code_review\n", t.Num)
+				fmt.Fprintf(os.Stderr, "  [react] #%d worker finished — advancing to review\n", t.Num)
 				// Try to advance (creates PR if needed)
 				if advanceDevelopToCodeReview(tasksFile, tf, t) == 0 {
 					changed = true
@@ -975,7 +974,7 @@ func boardReact(tasksFile string) {
 		if t.PR == 0 {
 			continue
 		}
-		if t.Stage != "code_review" {
+		if t.Stage != "review" {
 			continue
 		}
 
@@ -994,10 +993,10 @@ func boardReact(tasksFile string) {
 			fmt.Fprintf(os.Stderr, "  [react] #%d PR #%d CI failed\n", t.Num, t.PR)
 		}
 
-		// Approved + green → deploy
+		// Approved + green → approve
 		if strings.Contains(result, "APPROVED") && !strings.Contains(result, "FAILURE") {
-			fmt.Fprintf(os.Stderr, "  [react] #%d PR #%d approved + green → deploy\n", t.Num, t.PR)
-			transition(t, "deploy", "auto-advanced: CI green + review approved")
+			fmt.Fprintf(os.Stderr, "  [react] #%d PR #%d approved + green → approve\n", t.Num, t.PR)
+			transition(t, "approve", "auto-advanced: CI green + review approved")
 			changed = true
 		}
 	}
