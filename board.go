@@ -718,16 +718,35 @@ func boardReact(tasksFile string) {
 		return
 	}
 
+	changed := false
+	root, _ := findGitRoot()
+	repoName := filepath.Base(root)
+
 	for i := range tf.Tasks {
 		t := &tf.Tasks[i]
+
+		// Auto-advance develop → code_review when worker finishes
+		if t.Stage == "develop" && t.Spawn != "" {
+			worktreePath := filepath.Join(filepath.Dir(root), repoName+"-"+t.Spawn)
+			doneFile := filepath.Join(worktreePath, ".ralph-done")
+			if _, err := os.Stat(doneFile); err == nil {
+				fmt.Fprintf(os.Stderr, "  [react] #%d worker finished — advancing to code_review\n", t.Num)
+				// Try to advance (creates PR if needed)
+				if advanceDevelopToCodeReview(tasksFile, tf, t) == 0 {
+					changed = true
+				}
+				continue
+			}
+		}
+
+		// For tasks with PRs, check GitHub status
 		if t.PR == 0 {
 			continue
 		}
-		if t.Stage != "code_review" && t.Stage != "develop" {
+		if t.Stage != "code_review" {
 			continue
 		}
 
-		// Check PR status
 		out, err := exec.Command("gh", "pr", "view", fmt.Sprintf("%d", t.PR),
 			"--json", "statusCheckRollup,reviewDecision,mergeable",
 			"--jq", "{checks: [.statusCheckRollup[]? | .conclusion] | join(\",\"), decision: .reviewDecision, mergeable: .mergeable}",
@@ -738,19 +757,22 @@ func boardReact(tasksFile string) {
 
 		result := strings.TrimSpace(string(out))
 
-		// Check if CI failed
+		// CI failed
 		if strings.Contains(result, "FAILURE") {
-			fmt.Fprintf(os.Stderr, "  [react] PR #%d CI failed — %s\n", t.PR, t.Title)
+			fmt.Fprintf(os.Stderr, "  [react] #%d PR #%d CI failed\n", t.Num, t.PR)
 		}
 
-		// Check if approved + green
+		// Approved + green → deploy
 		if strings.Contains(result, "APPROVED") && !strings.Contains(result, "FAILURE") {
-			fmt.Fprintf(os.Stderr, "  [react] PR #%d approved + green — ready to merge: %s\n", t.PR, t.Title)
-			t.Stage = "deploy"
+			fmt.Fprintf(os.Stderr, "  [react] #%d PR #%d approved + green → deploy\n", t.Num, t.PR)
+			transition(t, "deploy", "auto-advanced: CI green + review approved")
+			changed = true
 		}
 	}
 
-	saveTasks(tasksFile, tf)
+	if changed {
+		saveTasks(tasksFile, tf)
+	}
 }
 
 func truncate(s string, n int) string {
