@@ -66,7 +66,7 @@ var boardUsage = `Usage: sesh board [flags]
   sesh board --json          Output raw tasks.json
   sesh board --file PATH     Use specific tasks file
 
-  Pipeline: scope → develop → review → approve → done
+  Pipeline: scope → develop → review ⇄ fix → approve → done
   Tasks are referenced by number (#7) or ID (tuco-qa).
   Tasks can be blocked: --set 7 blocked-by 6 (unblock: --set 7 unblock 6)`
 
@@ -326,7 +326,7 @@ func boardRender(tasksFile string) int {
 	}
 
 	fmt.Printf("sesh board — %s\n", time.Now().Format("2006-01-02 15:04"))
-	fmt.Println("scope → develop → review → approve → done")
+	fmt.Println("scope → develop → review ⇄ fix → approve → done")
 	fmt.Println()
 
 	for _, s := range stages {
