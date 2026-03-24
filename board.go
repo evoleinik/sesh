@@ -1028,14 +1028,25 @@ func taskPriority(p string) int {
 
 // workerStatus returns a short status string for a worker in a worktree
 func workerStatus(worktreePath string) string {
+	// Count commits first (used in multiple places)
+	commits := 0
+	if out, err := exec.Command("git", "-C", worktreePath, "log", "--oneline", "--not", "main").Output(); err == nil {
+		trimmed := strings.TrimSpace(string(out))
+		if trimmed != "" {
+			commits = len(strings.Split(trimmed, "\n"))
+		}
+	}
+
 	// Check if done
 	if _, err := os.Stat(filepath.Join(worktreePath, ".ralph-done")); err == nil {
-		return "[✓ done]"
+		if commits == 0 {
+			return "[⚠ done but 0 commits — may have failed]"
+		}
+		return fmt.Sprintf("[✓ done, %d commits]", commits)
 	}
 
 	// Check if process is alive via .spawn-meta PID
 	alive := false
-	startedAt := ""
 	metaPath := filepath.Join(worktreePath, ".spawn-meta")
 	if meta, err := os.ReadFile(metaPath); err == nil {
 		for _, line := range strings.Split(string(meta), "\n") {
@@ -1044,9 +1055,6 @@ func workerStatus(worktreePath string) string {
 				if exec.Command("kill", "-0", pid).Run() == nil {
 					alive = true
 				}
-			}
-			if strings.HasPrefix(line, "started=") {
-				startedAt = strings.TrimPrefix(line, "started=")
 			}
 		}
 	}
@@ -1099,24 +1107,30 @@ func workerStatus(worktreePath string) string {
 		}
 	}
 
-	// Count commits
-	commits := 0
-	if out, err := exec.Command("git", "-C", worktreePath, "log", "--oneline", "--not", "main").Output(); err == nil {
-		trimmed := strings.TrimSpace(string(out))
-		if trimmed != "" {
-			commits = len(strings.Split(trimmed, "\n"))
-		}
-	}
-
-	// Elapsed time
-	elapsed := ""
-	if startedAt != "" {
-		if t, err := time.Parse(time.RFC3339, startedAt); err == nil {
-			dur := time.Since(t)
-			if dur < time.Hour {
-				elapsed = fmt.Sprintf("%dm", int(dur.Minutes()))
-			} else {
-				elapsed = fmt.Sprintf("%dh%dm", int(dur.Hours()), int(dur.Minutes())%60)
+	// Last action from spawn log — most recent tool call
+	lastAction := ""
+	logPath := filepath.Join(worktreePath, ".spawn-log")
+	if logData, err := os.ReadFile(logPath); err == nil {
+		logLines := strings.Split(string(logData), "\n")
+		// Scan backwards for a tool call line (▶ Tool  description)
+		for i := len(logLines) - 1; i >= 0; i-- {
+			line := strings.TrimSpace(logLines[i])
+			// Strip ANSI codes
+			for strings.Contains(line, "\033[") {
+				start := strings.Index(line, "\033[")
+				end := strings.IndexByte(line[start+2:], 'm')
+				if end >= 0 {
+					line = line[:start] + line[start+2+end+1:]
+				} else {
+					break
+				}
+			}
+			if strings.HasPrefix(line, "▶ ") {
+				lastAction = line
+				if len(lastAction) > 60 {
+					lastAction = lastAction[:60] + "..."
+				}
+				break
 			}
 		}
 	}
@@ -1125,14 +1139,11 @@ func workerStatus(worktreePath string) string {
 	var parts []string
 
 	if alive {
-		parts = append(parts, "⟳ running")
+		parts = append(parts, "⟳")
 	} else {
 		parts = append(parts, "⏸ stopped")
 	}
 
-	if elapsed != "" {
-		parts = append(parts, elapsed)
-	}
 	if iterInfo != "" {
 		parts = append(parts, iterInfo)
 	}
@@ -1142,8 +1153,10 @@ func workerStatus(worktreePath string) string {
 
 	result := "[" + strings.Join(parts, ", ") + "]"
 
-	// Add hint on next line
-	if stateHint != "" {
+	// Show last action or state hint on next line
+	if lastAction != "" {
+		result += "\n         " + lastAction
+	} else if stateHint != "" {
 		result += "\n         " + stateHint
 	}
 
