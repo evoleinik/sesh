@@ -1118,7 +1118,11 @@ func workerStatus(worktreePath string) string {
 			if len(parts) > 1 {
 				iterNum := strings.TrimRight(parts[1], ")")
 				if strings.Contains(first, "auto-generated") {
-					iterInfo = "starting up"
+					// Only say "starting up" if no commits yet
+					if commits == 0 {
+						iterInfo = "starting up"
+					}
+					// else: skip — commits exist but state wasn't written
 				} else {
 					iterInfo = "iter " + iterNum
 				}
