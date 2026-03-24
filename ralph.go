@@ -335,7 +335,7 @@ func Ralph(cfg RalphConfig, ev *Event) int {
 		}
 
 		prompt := buildPrompt(i, cfg.MaxIter, cfg.StateFile, cfg.DoneFile, cfg.PromptFile, cfg.PromptText, stallCount, cfg.PlanMode, steerOutput)
-		result := RunIteration(ctx, prompt, cfg.MaxTurns, extraEnv, cfg.Stdout)
+		result := runIterationN(ctx, prompt, cfg.MaxTurns, extraEnv, cfg.Stdout, i)
 		lastOutput = result.Output
 
 		// check done/state files
@@ -411,6 +411,10 @@ func Ralph(cfg RalphConfig, ev *Event) int {
 
 // RunIteration runs one claude session and formats output in-process.
 func RunIteration(ctx context.Context, prompt string, maxTurns int, extraEnv []string, w io.Writer) IterResult {
+	return runIterationN(ctx, prompt, maxTurns, extraEnv, w, 0)
+}
+
+func runIterationN(ctx context.Context, prompt string, maxTurns int, extraEnv []string, w io.Writer, iterNum int) IterResult {
 	start := time.Now()
 
 	args := []string{
@@ -455,9 +459,23 @@ func RunIteration(ctx context.Context, prompt string, maxTurns int, extraEnv []s
 	}()
 
 	// FormatStream in goroutine so cmd.Wait() isn't blocked behind pipe reads.
-	// Tee output to both the user's terminal and a buffer for steering.
+	// Tee output to both the user's terminal, a buffer for steering,
+	// and a per-iteration session file for transcript replay.
 	var outputBuf bytes.Buffer
-	tee := io.MultiWriter(w, &outputBuf)
+	writers := []io.Writer{w, &outputBuf}
+
+	// Save raw stream-json per iteration for transcript replay
+	if iterNum > 0 {
+		sessDir := ".spawn-sessions"
+		os.MkdirAll(sessDir, 0755)
+		sessFile := filepath.Join(sessDir, fmt.Sprintf("iter-%d.jsonl", iterNum))
+		if f, err := os.Create(sessFile); err == nil {
+			defer f.Close()
+			writers = append(writers, f)
+		}
+	}
+
+	tee := io.MultiWriter(writers...)
 	doneFmt := make(chan struct{})
 	go func() {
 		FormatStream(stdout, tee)
