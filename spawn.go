@@ -183,6 +183,38 @@ func runSpawn(args []string) int {
 		fmt.Fprintf(os.Stderr, "spawn: bun install failed (continuing anyway): %v\n", err)
 	}
 
+	// Initialize Neon branch + sync DB URLs to Vercel preview
+	neonScript := filepath.Join(worktreePath, "scripts", "neon-init-branch.sh")
+	if _, err := os.Stat(neonScript); err == nil {
+		fmt.Fprintf(os.Stderr, "spawn: initializing Neon branch...\n")
+		neon := exec.Command("bash", neonScript, branchName)
+		neon.Dir = worktreePath
+		neon.Stdout = os.Stderr
+		neon.Stderr = os.Stderr
+		if err := neon.Run(); err != nil {
+			fmt.Fprintf(os.Stderr, "spawn: neon-init-branch failed (continuing): %v\n", err)
+		} else {
+			// Sync DATABASE_URL and DIRECT_DATABASE_URL to Vercel preview
+			envLocal := filepath.Join(worktreePath, ".env.local")
+			if data, err := os.ReadFile(envLocal); err == nil {
+				for _, line := range strings.Split(string(data), "\n") {
+					for _, key := range []string{"DATABASE_URL", "DIRECT_DATABASE_URL"} {
+						if strings.HasPrefix(line, key+"=") {
+							val := strings.TrimPrefix(line, key+"=")
+							val = strings.Trim(val, "\"")
+							cmd := exec.Command("bash", "-c",
+								fmt.Sprintf("printf '%%s' %q | vercel env add --force %s preview %s 2>/dev/null",
+									val, key, branchName))
+							cmd.Dir = worktreePath
+							cmd.Run()
+						}
+					}
+				}
+				fmt.Fprintf(os.Stderr, "spawn: synced DB URLs to Vercel preview/%s\n", branchName)
+			}
+		}
+	}
+
 	// Write spawn metadata
 	meta := fmt.Sprintf("prompt=%s\nname=%s\nstarted=%s\nmaxIter=%s\n",
 		promptFile, name, time.Now().Format(time.RFC3339), maxIter)
