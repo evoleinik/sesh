@@ -79,6 +79,33 @@ func TestCronMarkerUpdate(t *testing.T) {
 	}
 }
 
+func TestSkipWorktreeDir(t *testing.T) {
+	// Primary checkout: .git is a directory → IsDir == true (proceed)
+	primary := t.TempDir()
+	os.MkdirAll(filepath.Join(primary, ".git"), 0755)
+	info, err := os.Stat(filepath.Join(primary, ".git"))
+	if err != nil || !info.IsDir() {
+		t.Fatalf("primary .git should be a dir; err=%v info=%v", err, info)
+	}
+
+	// Worktree: .git is a file → IsDir == false (skip)
+	worktree := t.TempDir()
+	os.WriteFile(filepath.Join(worktree, ".git"), []byte("gitdir: /tmp/main/.git/worktrees/x\n"), 0644)
+	info, err = os.Stat(filepath.Join(worktree, ".git"))
+	if err != nil {
+		t.Fatalf("worktree .git stat: %v", err)
+	}
+	if info.IsDir() {
+		t.Error("expected .git to be a file in worktree, got dir")
+	}
+
+	// Non-git dir: stat returns ENOENT (proceed by backward compat)
+	nongit := t.TempDir()
+	if _, err := os.Stat(filepath.Join(nongit, ".git")); !os.IsNotExist(err) {
+		t.Errorf("expected non-existent .git, got err=%v", err)
+	}
+}
+
 func TestCronNoProjects(t *testing.T) {
 	// CronCurate with no matching projects should return empty
 	// We can't easily test this without mocking the home dir,

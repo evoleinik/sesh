@@ -95,6 +95,14 @@ func CronCurate() ([]CronResult, error) {
 			continue
 		}
 
+		// Skip git worktrees — only curate canonical primary checkouts.
+		// In a primary checkout `.git` is a directory; in a worktree it's a
+		// file containing `gitdir: ...`. Non-git dirs (no .git at all) are
+		// allowed through for backward compat.
+		if info, err := os.Stat(filepath.Join(decodedPath, ".git")); err == nil && !info.IsDir() {
+			continue
+		}
+
 		hasNew, err := HasNewDigests(decodedPath)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "sesh: skip %s: %v\n", filepath.Base(decodedPath), err)
@@ -179,7 +187,7 @@ func runCuration(projectDir string) error {
 
 	cfg := RalphConfig{
 		PromptFile: promptPath,
-		MaxIter:    1,
+		MaxIter:    3,
 	}
 	code := Ralph(cfg, nil)
 	if code != 0 {
