@@ -2,6 +2,26 @@
 
 You are curating session digests into project knowledge. This is automated background work — be precise, not chatty.
 
+## Step 0: Bail-early check (run FIRST, before any other work)
+
+Glance at recent digest filenames + sizes:
+```
+ls -lS .claude/digests/*.md 2>/dev/null | head -10
+```
+
+Bail immediately if any of these are true:
+- Digests are mostly tiny (<1 KB) — those are sessions that did nothing meaningful
+- All digest filenames suggest trivial work (single-file fixes, doc tweaks, status checks)
+- `git status` shows an unmerged/conflict state (`UU`, `UD`, `DU`, `AU`, `UA`) — git is broken, don't try to commit anything
+
+To bail:
+```
+touch .ralph-done
+exit 0
+```
+
+The cost of a false-bail is "we'll catch it next time." The cost of flailing is wasted iterations and a stuck marker.
+
 ## Process
 
 1. Read recent digests:
@@ -38,15 +58,16 @@ You are curating session digests into project knowledge. This is automated backg
    git commit -m "docs: curate from session digests"
    ```
 
-7. Signal completion:
+7. **ALWAYS** signal completion at end (whether you edited anything or not):
    ```
    touch .ralph-done
    ```
+   This is mandatory. Do not skip it.
 
 ## Rules
 
-- If no new patterns found, just create `.ralph-done` and exit
 - Never modify the digest files themselves
 - Never modify source code — documentation only
 - Less is more: only add entries that earn their place
 - Each entry should save future-you at least 5 minutes
+- Don't iterate trying different edits. Decide once, commit once, done.
